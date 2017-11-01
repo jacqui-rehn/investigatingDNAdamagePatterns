@@ -1,0 +1,618 @@
+---
+title: "Effect of removing short reads on length distribution"
+author: "Jacqueline Rehn"
+date: "11/1/2017"
+output: html_document
+---
+---
+title: "aDNA Damage - Length filtered data "
+author: "Jacqueline Rehn"
+date: "7/28/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#load packages
+library(dplyr)
+library(readr)
+library(magrittr)
+library(tibble)
+library(stringr)
+library(reshape2)
+library(ggplot2)
+library(data.table)
+library(scales)
+library(gridExtra)
+library(pander)
+
+#set aesthetics for plots
+theme_set(theme_bw())
+
+palette <- c("#FF3333", "#3333FF", "#009900", "#FF9900", "#990099", 
+             "#33CCCC", "#66CC66", "#FFCC66", "#FF99CC", "#3399FF", 
+             "#FF6666", "#9966FF")
+
+palette15 <- c("#FF3333", 
+               "#3333FF", 
+               "#009900", 
+               "#FF9900", 
+               "#FF99CC", 
+               "#3399FF", 
+               "#66CC66", 
+               "#FFCC66", 
+               "#FF6666",
+               "#006699",
+               "#336600",
+               "#FFCC99",
+               "#FF0066",
+               "#9966FF",
+               "#33CCCC")
+
+sample_names <- c(`CHIMP` = "Chimp", `ELSIDRON1L7` = "Elsidron 1", `ELSIDRON2L7` = "Elsidron 2", 
+                  `ModernL7` = "Modern", `SPYNEWL8` = "Spy II", `SPYOLD` = "Spy I")
+
+```
+
+## R Markdown
+
+###Are there a greater proportion of short fragments aligning?
+
+Generated data about the length of mapped reads at different MAPQ cut-offs by running the following commands in bash on Modern and Elsidron1 samples.
+
+```{bash eval=FALSE}
+
+#cd mapData/
+#echo -e "count\tlength" > map_Lengths.txt
+#echo -e "2NoAdapt_ELSIDRON1L7_lTACTG_rCTCGA_rmdup.bam" >> map_Lengths.txt
+
+#collate length of mapped reads in the de-duplicated bam file (prior to MAPQ filtering)
+#samtools view 2NoAdapt_ELSIDRON1L7_lTACTG_rCTCGA_rmdup.bam | awk '{print length($10)}' | sort -n | uniq -c >> map_Lengths.txt
+#echo -e "2NoAdapt_ModernL7_lAAGAG_rNONE_rmdup.bam" >> map_Lengths.txt
+#samtools view 2NoAdapt_ModernL7_lAAGAG_rNONE_rmdup.bam | awk '{print length($10)}' | sort -n | uniq -c >> map_Lengths.txt
+
+#collate length of mapped reads with MAPQ > 25 in the de-duplicated bam file 
+#echo -e "2NoAdapt_ELSIDRON1L7_lTACTG_rCTCGA_Q25_rmdup.bam" >> map_Lengths.txt
+#samtools view -q 25 2NoAdapt_ELSIDRON1L7_lTACTG_rCTCGA_rmdup.bam | awk '{print length($10)}' | sort -n | uniq -c >> map_Lengths.txt
+echo -e "2NoAdapt_ModernL7_lAAGAG_rNONE_Q25_rmdup.bam" >> map_Lengths.txt
+#samtools view -q 25 2NoAdapt_ModernL7_lAAGAG_rNONE_rmdup.bam | awk '{print length($10)}' | sort -n | uniq -c >> map_Lengths.txt
+
+#collate length of mapped reads with MAPQ > 30 in the de-duplicated bam file 
+#echo -e "2NoAdapt_ELSIDRON1L7_lTACTG_rCTCGA_Q30_rmdup.bam" >> map_Lengths.txt
+#samtools view -q 30 2NoAdapt_ELSIDRON1L7_lTACTG_rCTCGA_rmdup.bam | awk '{print length($10)}' | sort -n | uniq -c >> map_Lengths.txt
+#echo -e "2NoAdapt_ModernL7_lAAGAG_rNONE_Q30_rmdup.bam" >> map_Lengths.txt
+#samtools view -q 30 2NoAdapt_ModernL7_lAAGAG_rNONE_rmdup.bam | awk '{print length($10)}' | sort -n | uniq -c >> map_Lengths.txt
+
+```
+
+Using data in the resultant text file, plotted the proportion of reads mapped by length. This was completed as follows:
+
+1. import map_Lengths.txt data with readr, tidy data with dplyr 
+2. convert continuous mapped lengths to categorical values and summarise reads within each category
+3. import fastq_length.txt data with readr and tidy
+4. convert continuous fastq lengths to categorical values and summarise reads within each category
+5. join map_Lengths and fastq_length data by sample and lengthRange (dplyr)
+6. calcualte proportion of reads mapping for each lengthRange but dividing occ of mappedLength by occ of fastqLength
+
+```{r alignment lengths}
+
+#### Compare proportion of reads which aligned at different length ranges
+
+#import data about map_Lengths for Elsidron1 and Modern mapped against 15 genomes 
+  #(6 sets results with MAPQ 0, 25, 30)
+mapLengths <- read.csv("mapData/map_Lengths.txt", sep = "", skip = 1, 
+                       header = FALSE, col.names = c("count", "length")) %>% 
+  mutate(bam = grepl("bam", count), fileNo = cumsum(bam))
+#extract the fileInfo and fileNo information
+fileInfo <- mapLengths[grep("bam", mapLengths$c),] %>% select(count, fileNo)
+#rejoin fileInfo as a separate variable
+mapLengths <- mapLengths %>% left_join(fileInfo, by = "fileNo") %>% 
+  select(-bam, -fileNo) %>% 
+  set_colnames(c("count", "length", "fileName")) %>% 
+  filter(length != "NA")
+#convert factor variables to character
+mapLengths <- mapLengths %>% mutate_if(is.factor, as.character)
+#convert splitCount from character to numeric
+mapLengths$count <- as.numeric(mapLengths$count)
+
+##Convert continuous data to categorical (i.e. summarise by length)
+mapLengths$lengthRange <- cut(mapLengths$length, seq(21,191,10), right = FALSE, 
+                              labels=c("21-30", "31-40", "41-50", "51-60", "61-70", 
+                                       "71-80", "81-90", "91-100", "101-110", 
+                                       "111-120", "121-130", "131-140", "141-150", 
+                                       "151-160", "161-170", "171-180", "181-190"))
+
+#apply function to mapLengths
+#mapLengths <- categorise_lengths(mapLengths$length)
+
+#Sum occurenced within each category
+mapLengths <- mapLengths %>% 
+  split(f = .$fileName) %>% 
+  lapply(function(x){x %>% 
+    select(-length, -fileName) %>% 
+    group_by(lengthRange) %>% 
+    summarise_each(funs(sum))}) %>% bind_rows(.id = "fileName")
+
+#edit fileName to increase readability
+mapLengths$fileName <- gsub('L7_lAAGAG_rNONE_rmdup.bam', '_Q0', mapLengths$fileName)
+mapLengths$fileName <- gsub('L7_lTACTG_rCTCGA_rmdup.bam', '_Q0', mapLengths$fileName)
+mapLengths$fileName <- gsub('2NoAdapt_', '', mapLengths$fileName)
+mapLengths$fileName <- gsub('L7_lTACTG_rCTCGA', '', mapLengths$fileName)
+mapLengths$fileName <- gsub('L7_lAAGAG_rNONE', '', mapLengths$fileName)
+mapLengths$fileName <- gsub('_rmdup.bam', '', mapLengths$fileName)
+mapLengths$fileName <- gsub('ELSIDRON', 'Elsidron', mapLengths$fileName)
+
+#################################################################################
+
+###import fastq length data
+#make a list of fastq files
+fastqFiles <- list.files("trimData/", pattern = "fastq.gz$", full.names = FALSE)
+
+#Read-in text file fastq_length.txt and assign to object
+fastqLength <- read.csv(file="trimData/fastq_length.txt", 
+                        sep="", skip = 1, header = FALSE, 
+                        col.names = c("occ", "length"))
+#Split at .fastq.gz to generate a list
+fastqLength <- fastqLength %>% mutate(fastq = grepl("fastq", occ), 
+                                      fileNo = cumsum(fastq)) %>% 
+  split(f = .$fileNo)
+#assign this list of fastq files as names of files in fastqLength
+names(fastqLength) <- fastqFiles
+#Bind_rows of list, taking list names and re-inserting as fileName, then remove unnecessary information
+fastqLength <- fastqLength %>% 
+  bind_rows(.id = "fileName") %>% 
+  select(-fastq, -fileNo) %>% filter(length != "NA")
+#split fileName into adapters, sampleID and additional info
+fastqLength <- colsplit(fastqLength$fileName, "_", names=c("adapters", "sampleID", "extra")) %>% 
+  bind_cols(fastqLength) %>% 
+  select(-fileName, -adapters, -extra)
+#Convert fastqLength variable from factor to numeric
+fastqLength <- fastqLength %>% mutate_if(is.factor, as.character)
+fastqLength$occ <- as.numeric(fastqLength$occ)
+#select just Mod and Els1 data
+abrev_fastqLength <- fastqLength %>% filter(sampleID == c("ELSIDRON1L7", "ModernL7"))
+#add length categories
+abrev_fastqLength <- categorise_lengths(abrev_fastqLength)
+
+#Plot the length distributions taken from the fastq files
+abrev_fastqLength %>% ggplot(aes(x=length, y=occ, colour=sampleID)) + 
+  geom_line() + 
+  labs(x="Read length", y="Number of reads", 
+       colour="Sample", title="Length distribution of fastq reads") + 
+  scale_colour_manual(values = palette, labels=c(sample_names))
+
+#Sum occurenced within each length category
+abrev_fastqLength <- abrev_fastqLength %>% 
+  split(f = .$sampleID) %>% 
+  lapply(function(x){x %>% 
+    select(-length, -sampleID) %>% 
+    group_by(lengthRange) %>% 
+    summarise_each(funs(sum))}) %>% bind_rows(.id = "sampleID")
+#Edit sampleID to be identical with mapLengths
+abrev_fastqLength$sampleID <- gsub('ELSIDRON1L7', 'Elsidron1', abrev_fastqLength$sampleID)
+abrev_fastqLength$sampleID <- gsub('ModernL7', 'Modern', abrev_fastqLength$sampleID)
+#Change name of occ vector to fastqOcc
+names(abrev_fastqLength) <- c("sampleID", "lengthRange", "fastqOcc")
+
+#######################################################################
+
+#Plot number of reads mapped by length
+mapLengths %>%
+  ggplot(aes(x=lengthRange, y=count, fill=fileName)) + 
+  geom_bar(stat = "identity") + #, colour="#FF3333", fill="#FF3333") + 
+  scale_fill_manual(values = palette) + 
+  facet_wrap(~fileName) + 
+  guides(fill=FALSE) +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=.5)) +
+  labs(x="Length Range", y="Number of reads mapped") +
+  ggtitle("Number of reads mapped, by length")
+
+####extract sampleID, and MAPQ from fileNames in mapLengths
+#split fileName into adapters, sampleID and additional info
+mapLengths <- colsplit(mapLengths$fileName, "_", names=c("sampleID", "MAPQ")) %>% 
+  bind_cols(mapLengths) %>% 
+  select(-fileName)
+
+#join information on occur of each length range in fastqFile and in mapLengths
+mapLengths <- abrev_fastqLength %>% left_join(mapLengths, by = c("sampleID", "lengthRange"))
+
+MAPQ_names <- c(
+  'Q0'="Without MAPQ filtering",
+  'Q25'="MAPQ > 25",
+  'Q30'="MAPQ > 30"
+)
+
+sample_names <- c(
+  'Elsidron1'="Elsidron 1",
+  'Modern'="Modern"
+)
+
+#Plot proportion of reads mapped by length
+mapLengths %>% mutate(prop = count/fastqOcc) %>%
+  ggplot(aes(x=lengthRange, y=prop, fill=sampleID)) + 
+  geom_bar(stat = "identity") + 
+  scale_fill_manual(values = palette) + 
+  facet_grid(sampleID~MAPQ, labeller = labeller(sampleID = sample_names, MAPQ = MAPQ_names)) + 
+  guides(fill=FALSE) +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=.5)) +
+  labs(x="Length Range", y="Proportion of reads mapped") +
+  ggtitle("Proportion of reads mapped, by length")
+
+```
+
+From the length distribution displayed for fastq reads we see that in both the modern and ancient Elsidron 1 sample the majority of reads have a length of ~50bp. The modern sample has a wider distribution of reads than the ancient. Plotting the number of reads by length range it appears aligned reads follow the distribution observed in the sequencing data (fastq files), however, when we calculate the proportion of reads by length, we see that considerably more short reads (21-30bp) are aligning than longer reads. MAPQ filtering reduces but does not eliminate this phenomenon. 
+
+This result is not unexpected since shorter reads are invariably less unique than longer DNA sequences and are thus more likely to map to a genome. However, due to the significant amount of DNA sequence conservation between microbial genomes, it is also expected that these short reads will contribute to spurious alignments as they may represent sequences from species not present in the alignment index. This will result in a skewed distribution of the DNA fragment size. Given that it is not possible to determine whether reads aligning are truely representative of the genome to which they have aligned, it is not reasonable to make conclusions about the fragmentation of DNA of different genomes from the mapDamage2.0 estimates alone. 
+
+## Effect of removing fragments shorter than 30bp
+
+By filtering very short reads (<30bp) from the pre-processed fastq files and processing the filtered fastq file through the damage analysis pipeline it is possible to observe the effect of removing very short reads on the damage estimates provided.
+
+Short reads were removed using the following bash script. Same could be achieved using a program such as AdapterRemoval and setting minimum length to 30bp.
+
+```{bash eval=FALSE}
+
+#!/bin/bash
+
+#USAGE: Requires processed_fastq files in data directory
+
+## Input: Adaptor Trimmed FASTQ file
+## Output: Fastq file excluding reads < 30bp
+
+#Specify variables
+DATADIR=/fast/users/a1698312/data
+TRIMDIR=/fast/users/a1698312/trimData
+
+#change into data directory
+if [ -d ${DATADIR} ]
+then
+  echo "Changing to data directory"
+  cd ${DATADIR}
+else
+  echo "Cannot find ${DATADIR}"
+exit1
+fi
+
+#loop through and remove reads lt 30bp
+for fastq_file in *fastq.gz
+do
+  zcat ${fastq_file} | awk 'BEGIN {OFS = "\n"} {header = $0 ; getline seq ; getline qheader ; getline qseq ; \ 
+    if (length(seq) >= 30) {print header, seq, qheader, qseq}}' > ${TRIMDIR}/${fastq_file/%fastq.gz/fastq}
+done
+
+```
+
+Damage estimates, both of DNA fragment length and nucleotide misincorporation were assessed usign the mapDamage2.0 results output.
+
+
+```{r mapDamage Length Data, echo=FALSE}
+
+#create a list of lgdist files
+lgDistFiles <- list.files("filteredMapData/highQualMapData", 
+                          pattern = "lgdistribution.txt", 
+                          full.names = TRUE, recursive = TRUE)
+#read-in data from each text file and bind into a data frame
+lengthData <- lgDistFiles %>% lapply(function(x){
+  read_delim(x, delim = "\t", skip = 4, col_names = FALSE, col_types = "cnn") %>%
+    set_colnames(c("std", "length", "freq")) %>%
+    mutate(fileName = x)
+}) %>%
+  bind_rows
+#edit FileNames to include only the sampleID and genome
+source("editFileNames.R")
+lengthData$fileName <- editFileNames(lengthData)
+lengthData$fileName <- gsub('_Q30', '', lengthData$fileName)
+lengthData$fileName <- gsub('filteredMapData/highQualMapData/results_', '', lengthData$fileName)
+
+#split fileName into sampleID and genome
+lengthData <- colsplit(lengthData$fileName, "_", names = c("sampleID", "genome")) %>% 
+  bind_cols(lengthData) %>% 
+  select(-fileName)
+
+#Collate lengths for each sample & plot distributions
+lgDistFilterPlot1 <- lengthData %>% split(f = .$sampleID) %>%
+  lapply(function(x){x %>% select(length, freq) %>% 
+      group_by(length) %>% 
+      summarise_each(funs(sum))}) %>% 
+  bind_rows(.id = "sampleID") %>% 
+    ggplot(aes(x=length, y=freq, colour=sampleID)) + 
+    geom_line() + 
+    theme_bw() + 
+    labs(x="Read length", y="Number of reads", colour="Sample") + 
+    ggtitle("Distribution of filtered fragment lengths (Q>30)")
+
+##### Repeat for non-length filtered and plot side-by-side for comparison
+#list files from mapData
+unfiltered_lgDistFiles <- list.files("mapData/highQualMapData", 
+                          pattern = "lgdistribution.txt", 
+                          full.names = TRUE, recursive = TRUE)
+
+#read-in data from each text file and bind into a data frame (modified as some files are empty)
+unfiltered_lengthData <- lapply(unfiltered_lgDistFiles,function(x){
+  x <- try(read.table(paste(x,sep=""), head=FALSE, stringsAsFactors=FALSE, sep="\t", 
+                      col.names = c("std", "length", "occ"), skip = 4)) %>% mutate(fileName = x)
+  if(inherits(x, "try-error"))
+    return(NULL)
+  else
+    return(x)
+}) %>% bind_rows
+
+#remove data for all files except relating to Elsidron1 and Modern
+unfiltered_lengthData <- unfiltered_lengthData %>% 
+  filter(!grepl("CHIMP", fileName)) %>% 
+  filter(!grepl("ELSIDRON2", fileName)) %>% 
+  filter(!grepl("SPY", fileName))
+
+#edit FileNames to include only the sampleID and genome
+unfiltered_lengthData$fileName <- editFileNames(unfiltered_lengthData)
+unfiltered_lengthData$fileName <- gsub('mapData/highQualMapData/results_', '', unfiltered_lengthData$fileName)
+
+#split fileName into sampleID and genome
+unfiltered_lengthData <- colsplit(unfiltered_lengthData$fileName, "_", names = c("sampleID", "genome")) %>% 
+  bind_cols(unfiltered_lengthData) %>% 
+  select(-fileName)
+
+#Collate lengths for each sample & plot distributions
+lgDistUnfilterPlot1 <- unfiltered_lengthData %>% split(f = .$sampleID) %>%
+  lapply(function(x){x %>% select(length, occ) %>% 
+      group_by(length) %>% 
+      summarise_each(funs(sum))}) %>% 
+  bind_rows(.id = "sampleID") %>% 
+    ggplot(aes(x=length, y=occ, colour=sampleID)) + 
+    geom_line() + 
+    theme_bw() + 
+    labs(x="Read length", y="Number of reads", colour="Sample") + 
+    ggtitle("Distribution of unfiltered fragment lengths (Q>30)")
+
+#plot side-by-side
+grid.arrange(lgDistUnfilterPlot1, lgDistFilterPlot1)
+
+```
+
+Plot distrubution as a box-plot
+
+```{r boxPlot lengths, message=FALSE}
+
+#plot overall length data (boxplot)
+expandedLengths <- lengthData %>% 
+  split(f = 1:nrow(.)) %>% 
+  lapply(function(x){
+    data_frame(sampleID = x$sampleID, 
+               genome = x$genome, 
+               length = rep(x$length, times = x$freq))}) %>% 
+  bind_rows()
+
+#BoxPlot
+expandedLengths %>% ggplot(aes(x=sampleID, y=length, fill=sampleID)) + 
+  geom_boxplot(outlier.color = "dark grey", outlier.size = 0.3) + 
+  theme_bw() + theme(axis.title.x = element_blank()) + 
+  ylab("Average Fragment Length") + guides(fill=FALSE) +
+  ggtitle("Average fragment lengths per sample (Q > 30)")
+```
+
+## Effect of filtering on lengths by genome
+
+```{r message=FALSE}
+
+#import phylum and cellWall data from genomeList.txt
+phylum <- read_delim("genomeList.txt", delim = "\t", col_names = c("genome", "phylum", "cellWall"), 
+           col_types = "c--cc")
+phylum$cellWall <- gsub('gramNeg', 'Gram -', phylum$cellWall)
+phylum$cellWall <- gsub('gramPos', 'Gram +', phylum$cellWall)
+
+#Bind phylum information to expandedLengths
+lengthData <- lengthData %>% left_join(phylum, by = "genome")
+         
+lengthData %>% split(f = .$sampleID) %>% 
+  lapply(function(x){x %>% 
+    ggplot(aes(x=length, y=freq, colour=cellWall)) + 
+    geom_line() + 
+    theme_bw() + 
+    labs(x="Read length", y="Number of reads", colour="Genome") + 
+    facet_wrap(~genome, ncol=3, scales = "free_y") + 
+    scale_colour_manual(values = palette15) +
+    theme(legend.position="none") + 
+    ggtitle(x$sampleID, paste("(MAPQ > 30, read length > 30bp)"))})
+
+```
+
+## Summarise stats for lengths
+
+```{r}
+###Calculate key statistics about fragment lengths accroding to sample
+lengthStatsBySample <- expandedLengths %>% 
+  select(sampleID, length) %>% 
+  group_by(., sampleID) %>% 
+  summarise(
+    count = n(), 
+    mean = mean(length, na.rm = TRUE), 
+    sd = sd(length, na.rm = TRUE), 
+    median = median(length, na.rm = TRUE), 
+    IQR = IQR(length, na.rm = TRUE)
+  )
+pander(lengthStatsBySample)
+```
+
+## Boxplot by genome
+
+```{r}
+######## Boxplots of Frag Length by Genome #########
+
+#Add information about bacterial cell wall
+cellWall <- data_frame(genome = c("A.oris", "A.parvulum", "C.gracilis", "E.saphenum", 
+                                  "F.nucleatum", "H.influenza", "M.neoaurum","M.oralis",
+                                  "N.meningitidis", "P.gingivalis", "P.intermedia", "S.mitis", 
+                                  "S.mutans", "T.denticola", "T.forsythia"), 
+                       cellWall = c("Gram +", "Gram +", "Gram -", "Gram +", "Gram -", "Gram -", 
+                                    "Mycobacterium", "Archeal", "Gram -", "Gram -", "Gram -", 
+                                    "Gram +", "Gram +", "Gram -", "Gram -"))
+
+
+#Bind this information to expandedLengths
+expandedLengths <- expandedLengths %>% left_join(cellWall, by = "genome")
+#Sort data according to cell wall
+expandedLengths <- expandedLengths[order(expandedLengths$cellWall),]
+#Convert genome to factor to prevent ggplot from re-ordering when plotting
+expandedLengths$genome <- factor(expandedLengths$genome, levels = unique(expandedLengths$genome))
+
+#boxplot Elsidron1
+expandedLengths %>% filter(sampleID == "Elsidron1") %>% 
+  ggplot(aes(x=genome, y=length, fill=cellWall)) + 
+  geom_boxplot(outlier.colour = "dark grey", outlier.size = 0.3) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=.5)) +
+  labs(x="", y="Fragment length", fill="Cell wall") + 
+  scale_fill_manual(values=c(palette)) + 
+  ggtitle("Elsidron 1 (MAPQ > 30, read length > 30bp)") + 
+  annotate("text", x=1:15, y=15, 
+           label=c("87,653","36,628","3573","241","619","7020","9170","11,236","28,721","122,806","1323","8275","2967","254","723"), size=3)
+
+#same plot for Modern
+expandedLengths %>% filter(sampleID == "Modern") %>% 
+  ggplot(aes(x=genome, y=length, fill=cellWall)) + 
+  geom_boxplot(outlier.colour = "dark grey", outlier.size = 0.3) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=.5)) +
+  labs(x="", y="Fragment length", fill="Cell wall") + 
+  scale_fill_manual(values=c(palette)) + 
+  ggtitle("Modern (MAPQ > 30, read length > 30bp)") + 
+  annotate("text", x=1:15, y=15, 
+           label=c("15","20,209","268,514","937","31,077","4033","42,858","6313","84,974","16,771","441","76","42,439","247","556"), size=3)
+
+
+```
+
+## length stats by genome
+
+```{r}
+###Calculate key statistics about fragment lengths accroding to genome
+filteredLengthStatsByGenome <- expandedLengths %>% 
+  select(sampleID, length, genome) %>% 
+  split(f = .$sampleID) %>% 
+  lapply(function(x){x %>% 
+  group_by(., genome) %>% 
+  summarise(
+    count = n(), 
+    mean = mean(length, na.rm = TRUE), 
+    sd = sd(length, na.rm = TRUE), 
+    median = median(length, na.rm = TRUE), 
+    IQR = IQR(length, na.rm = TRUE)
+  )})
+pander(filteredLengthStatsByGenome)
+```
+
+## substitution data
+
+```{r substitution data, message=FALSE}
+
+filteredCtoT.Files <- list.files("filteredMapData/highQualMapData/", pattern = "5pCtoT_freq.txt", full.names = TRUE, recursive = TRUE)
+
+filteredCtoTdata <- filteredCtoT.Files %>% lapply(function(z){ 
+    read_delim(z, delim = "\t", skip = 1, col_names = FALSE, col_types = cols("i", "n")) %>% 
+      set_colnames(c("pos", "freq")) %>% # specify the col_names
+      mutate(fileName = z)}) %>% # add the fileName to the data
+    bind_rows() # bind into single data frame
+filteredCtoTdata <- colsplit(filteredCtoTdata$fileName, "_", names = c("dir", "sampleID", "genome", "extra")) %>% 
+    bind_cols(filteredCtoTdata) %>% 
+    select(-dir, -fileName, -extra)
+filteredCtoTdata <- filteredCtoTdata %>% left_join(cellWall, by = "genome")
+#Sort data based on sampleID [,1] then cellWall [,6]
+filteredCtoTdata <- arrange(filteredCtoTdata, sampleID, cellWall)
+#Convert genome to factor to prevent ggplot from re-ordering when plotting
+filteredCtoTdata$genome <- factor(filteredCtoTdata$genome, levels = unique(filteredCtoTdata$genome))
+
+#plot
+filteredCtoTdata %>% filter(pos=="1") %>% 
+  ggplot(aes(x=genome, y=freq, shape=sampleID, colour=cellWall)) + 
+    geom_point(size = 4) + 
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5)) + 
+    ylab("Misincorporation frequency") + 
+    xlab("") +
+    ylim(0, 0.52) + 
+    scale_colour_manual(values = palette) + 
+    #scale_x_discrete(labels = c(genome_names)) +  
+    scale_shape_manual(values = c(19,17), name = "Sample ID")
+
+```
+
+## Compare C to T rates for filtered and non-filtered data
+
+```{r compare misincorporation before and after length filtering, message=FALSE}
+
+#Generate a list of 5pCtoT_freq.txt files
+initialCtoT.Files <- list.files("mapData/highQualMapData/", pattern = "5pCtoT_freq.txt", full.names = TRUE, recursive = TRUE)
+
+#read in files and manipulating data; 
+  #including adding phenotype characteristics and removing info from samples other than Elsidron1 and Modern
+initialCtoTfreqData <- initialCtoT.Files %>% lapply(function(x){read_delim(x, delim = "\t", skip = 1, col_names = FALSE, 
+                                                 col_types = cols("i", "n")) %>% # use lapply to read in each txt file
+      set_colnames(c("pos", "freq")) %>% # specify the col_names
+      mutate(fileName = x)}) %>% # add the fileName to the data
+    bind_rows() # bind into single data frame
+#edit fileNames
+initialCtoTfreqData$fileName <- editFileNames(initialCtoTfreqData)
+  #split fileName, retaining only sampleID and genome information in separate vectors
+initialCtoTfreqData <- colsplit(initialCtoTfreqData$fileName, "_", names = c("sampleID", "genome")) %>% 
+    bind_cols(initialCtoTfreqData) %>% 
+    select(-fileName) %>% 
+  filter(sampleID %in% c("ELSIDRON1","Modern"))
+
+#Plot CtoT rates for filtered and non-filtered side-by-side
+source("editGenomeNames.R")
+initialCtoTfreqData$genome <- editGenomeNames(initialCtoTfreqData)
+initialCtoTfreqData$sampleID <- gsub('ELSIDRON1', 'Elsidron1', initialCtoTfreqData$sampleID)
+names(initialCtoTfreqData) <- c("sampleID", "genome", "pos", "initial.freq")
+CtoTcombinedData <- initialCtoTfreqData %>% left_join(filteredCtoTdata, by = c("sampleID", "genome", "pos"))
+
+CtoTcombinedData %>% filter(pos == "1") %>% select(-cellWall) %>% 
+  melt(id.vars = c("sampleID", "genome", "pos")) %>%
+  ggplot(aes(x=genome, y=value, colour=variable)) + geom_point() + facet_wrap(~sampleID) + 
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5, size=10)) + 
+  labs(x="", y="Cytosine to thymine substitution frequency", colour="") + 
+  scale_colour_manual(values = c("#FF3333", "#3333FF"), labels = c("Min. read length 25bp","Min. read length 30bp"))
+
+#plot change in substitution frequency for each genome and sample
+CtoTcombinedData %>% mutate(freq_change = freq-initial.freq) %>% filter(pos == 1) %>% 
+  select(sampleID, genome, cellWall, freq_change) %>% 
+  ggplot(aes(x=genome, y=freq_change, fill=sampleID)) + 
+  geom_bar(stat = "identity", position = position_dodge()) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 10)) + 
+  labs(x="", y="change in reported substitution frequency", fill="Sample") + 
+  scale_fill_manual(values = c("#FF3333", "#3333FF"))
+
+```
+
+A change in the reported substitution frequency is occuring for some genomes. This appears to correlate with genomes which had the fewest reads aligning and the greatest skew in the length distribution. Can be confirmed by comparing the number of reads for each genome.
+
+
+```{r perc change in number reads aligning, message=FALSE}
+
+#Import non length filteredhigh_qual_split_count.txt data
+initialSplitCount <- read_delim(file = "mapData/highQualMapData/high_qual_split_count.txt", 
+                                 delim = "\t", skip = 1, col_names = FALSE) %>% 
+  set_colnames(c("fileName", "unfiltered_count"))
+#edit fileNames
+initialSplitCount$fileName <- editFileNames(initialSplitCount)
+
+#Split fileName into sampleID and genome
+initialSplitCount <- colsplit(initialSplitCount$fileName, "_", names=c("sampleID", "genome")) %>% 
+  bind_cols(initialSplitCount) %>% 
+  select(-fileName) %>% filter(sampleID %in% c("ELSIDRON1","Modern"))
+
+
+#combine these counts with counts for filtered data from 'filteredLengthStatsByGenome' object
+filteredLengthStatsByGenome %>% bind_rows(.id = "sampleID") %>% 
+  select(sampleID, genome, count) %>% 
+  mutate(sampleID = str_replace(sampleID, "Elsidron1", "ELSIDRON1")) %>% 
+  left_join(initialSplitCount, by = c("sampleID","genome")) %>% 
+  mutate(perc_change = (unfiltered_count-count)/unfiltered_count*100) %>% 
+  #select(sampleID, genome, perc_change) %>% 
+  #dcast(genome ~ sampleID) %>% 
+  pander(caption = "% change in reads aligning due to length filtering")
+
+```
+
+
+
+
+
+
