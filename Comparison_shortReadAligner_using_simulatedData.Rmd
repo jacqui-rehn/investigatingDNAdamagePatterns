@@ -1,0 +1,1035 @@
+---
+title: "Comparison of alignment algorithms"
+author: "Jacqueline Rehn"
+date: "11/1/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#load packages
+library(dplyr)
+library(readr)
+library(stringr)
+library(reshape2)
+library(tibble)
+library(magrittr)
+library(ggplot2)
+library(scales)
+library(pander)
+library(gridExtra)
+
+#set aesthetics
+theme_set(theme_bw())
+palette3 <- c("#FF6666", "#3399FF", "#66CC66")
+palette <- c("#FF3333", "#3333FF", "#009900", "#FF9900", "#990099", 
+             "#33CCCC", "#66CC66", "#FFCC66", "#FF99CC", "#3399FF", 
+             "#FF6666", "#9966FF")
+palette15 <- c("#FF3333", 
+               "#3333FF", 
+               "#009900", 
+               "#FF9900", 
+               "#FF99CC", 
+               "#3399FF", 
+               "#66CC66", 
+               "#FFCC66", 
+               "#FF6666",
+               "#006699",
+               "#336600",
+               "#FFCC99",
+               "#FF0066",
+               "#9966FF",
+               "#33CCCC")
+
+```
+
+## Introduction
+
+Assessing damage levels of aDNA sequences important step in validation of results. This is typcially completed using mapDamage2.0 which...
+A preliminary step to running mapDamage is to align sequences against a reference genome. In the case of ancient complex metagenomic samples this is complicated due to:
+
+1. damage levels within the fragments
+2. short fragments - less unique
+3. conservation between genomes of different microbial species
+4. evolutionary distance betweeen ancient and modern microbial genomes
+
+If spurious alignments are occuring this may affect the accuracy with which damage levels are estimated given that:
+
+- different microbial species may decay at different rates
+- environmental and laboratory contaminants will be of different ages and demonstrate different deamination levels.
+
+### Questions to address:
+
+1. Do currently used parameters for bwa result in spurious alignments?
+2. How is the number of spurious alignments affected by:
+      - length of reads
+      - levels of deamination
+3. Does quality filtering (by MAPQ) reduce the number of spurious alignments, and if so what is an appropriate cut-off
+
+## Simulated data
+
+30 oral metagenomic datasets containing 1.5 million reads were simulated with gargamel from 29 genomes, including 4 common contaminant species. Information about the genomes included in all simulated datasets is shown in Table 1, including an indication of whether the species was also present in the alignment index used for mapping. 
+
+```{r simulated Metagenomes, message=FALSE}
+
+#import data regarding summarising genomes used to simulate datasets
+simData <- read_csv("simFiles_genomeData.csv", col_names = FALSE, col_types = "c-n-c-ccnc", skip = 1)
+colnames(simData) <- c("taxon", "abundance", "genus", "species", "contaminant", "GC", "in_index")
+
+#Present data in table
+panderOptions('table.split.table', 300)
+simData %>% select(-species) %>% 
+  pander(caption = "Table 1: Summary of genome abundances used in all simulated datasets")
+
+```
+
+These were simulated to demonstrate variable fixed lengths and empirical lengths based on an ancient data sample. Deamination rates were also simulated at 10%, 50% and a real damage profile (~20%). For each length and deamination rate both an undamaged and damaged dataset was generated. 
+
+```{r plot of fixed abundances in simDataSets, message=FALSE}
+
+#Calculate number of reads expected from each taxon 
+simData_setAbundance <- simData %>% mutate(No.reads = 1500000*abundance)
+#no. expected aligned reads
+
+#Create a df with taxon and short taxon names for labelling
+taxon_labels <- c(`Actinomyces oris strain T14V` = "Actinomyces oris", 
+                  `Actinomyces sp. oral taxon 414 strain F0588` = "Actinomyces sp. oral taxon",
+                  `Aggregatibacter actinomycetemcomitans strain 624` = "Aggregatibacter actinomycetemcomitans", 
+                  `Aggregatibacter aphrophilus strain W10433` = "Aggregatibacter aphrophilus", 
+                  `Agrobacterium tumefaciens strain A` = "Agrobacterium tumefaciens", 
+                  `Bacillus subtilis BSn5` = "Bacillus subtilis", 
+                  `Capnocytophaga haemolytica strain CCUG 32990` = "Capnocytophaga haemolytica", 
+                  `Capnocytophaga sp. oral taxon 323 strain F0383` = "Capnocytophaga sp. oral taxon", 
+                  `Fusobacterium nucleatum subsp. nucleatum ATCC 25586` = "Fusobacterium nucleatum subsp. nucleatum", 
+                  `Fusobacterium nucleatum subsp. polymorphum strain ChDC F306` = "Fusobacterium nucleatum subsp. polymorphum", 
+                  `Fusobacterium nucleatum subsp. vincentii 3_1_36A2` = "Fusobacterium nucleatum subsp. vincentii", 
+                  `Leptotrichia buccalis DSM 113` = "Leptotrichia buccalis", 
+                  `Leptotrichia sp. oral taxon 847` = "Leptotrichia sp. oral taxon", 
+                  `Neisseria sicca strain FDAARGOS_2` = "Neisseria sicca", 
+                  `Neisseria meningitidis MC58 chromosome` = "Neisseria meningitidis", 
+                  `Porphyromonas gingivalis ATCC 33277 DNA` = "Porphyromonas gingivalis", 
+                  `Prevotella dentalis DSM 3688` = "Prevotella dentalis", 
+                  `Prevotella denticola F0289` = "Prevotella denticola", 
+                  `Rothia dentocariosa ATCC 17931` = "Rothia dentocariosa", 
+                  `Rothia mucilaginosa DNA complete genome strain: NUM-Rm6536` = "Rothia mucilaginosa", 
+                  `Sphingomonas sp. MM-1` = "Sphingomonas sp. MM-1", 
+                  `Staphylococcus epidermidis ATCC 12228` = "Staphylococcus epidermidis", 
+                  `Streptococcus cristatus AS 1.3089` = "Streptococcus cristatus", 
+                  `Streptococcus mitis B6` = "Streptococcus mitis", 
+                  `Streptococcus mutans NN202DNA` = "Streptococcus mutans NN202DNA", 
+                  `Streptococcus mutans UA159 chromosome` = "Streptococcus mutans UA159", 
+                  `Streptococcus oralis Uo5` = "Streptococcus oralis", 
+                  `Streptococcus sanguinis SK36` = "Streptococcus sanguinis", 
+                  `Veillonella parvula DSM 2008` = "Veillonella parvula")
+
+####plot abundance by taxon and by genus
+#plot of abundance by taxon, labelling those that are present in the alignment index
+simData_setAbundance %>% ggplot(aes(x=taxon, y=abundance, fill=contaminant)) + 
+  geom_bar(stat = "identity", position = position_dodge()) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1), legend.position = c(0.8,0.85)) + 
+  scale_x_discrete(labels=taxon_labels) + 
+  scale_fill_manual(values = palette15, 
+                    name = "", 
+                    breaks=c("FALSE", "TRUE"), 
+                    labels=c("Oral bacteria", "Common contaminant")) + 
+  labs(x="", y="Abundance") + 
+  annotate("text", x=c(1,3,6,9,12,14,15,16,18,19,22,24,26,28), 
+           y=c(0.03,0.04,0.03,0.10,0.03,0.03,0.03,0.03,0.03,0.04,0.03,0.01,0.05,0.03), label="*", size=8)
+
+```
+
+This can also be presented at the genus level.
+
+```{r message=FALSE}
+#Calculate abundance for each genome and plot as a barchart, indicating if genus origin is oral or contaminant
+genusAbundance <- simData %>% select(-taxon, -contaminant, -GC, -in_index, -species) %>% 
+  group_by(genus) %>% summarise_each(funs(sum))
+genusAbundance <- simData %>% select(genus, contaminant) %>% unique() %>% left_join(genusAbundance)
+genusAbundance %>% 
+  ggplot(aes(x=genus, y=abundance, fill=contaminant)) + 
+  geom_bar(stat = "identity", colour = "white", position = position_dodge()) + 
+  labs(x="", y="Abundance", title="Simulated abundance by genus", subtitle="Genus included in multi-alignment index (*)") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2)) + 
+  scale_fill_manual(values = c("#FF6666", "#3399FF"), 
+                      name = "", 
+                      breaks=c("FALSE", "TRUE"), 
+                      labels=c("Oral bacteria", "Common contaminant"))  
+```
+
+An additional 18 datasets were also simulated in which the level of endogenous bacterial sequences and environmental bacterial sequences within the sample was varied. A different deamination rate was applied to the endogenous (0.3), environmental(0.1) and laboratory (0.0) sequences to simulate observed differences in the damage levels of the different components. For the empirical length data, both a damaged and an undamaged dataset was simulated.
+A summary of the lengths and  damage rates for each file is displayed in Table 2.
+
+```{r simulated damage rates, message=FALSE}
+
+#generate list of all simulated datasets and assign to data frame
+simData.Files <- data_frame(list.files("data/", pattern = ".fa.gz", full.names = FALSE)) 
+#add name to column
+names(simData.Files) <- c("fileName")
+
+#extract information on length and damage rate from fileName and place in new column
+simData.Files <- simData.Files %>% mutate(length = str_extract(fileName, "(30bp|50bp|70bp|90bp|Empirical)"), 
+                                          damageRate = str_extract(fileName, "(0-1|0-5|Real|endo)"),
+                                          is.damaged = str_extract(fileName, "(\\.b|_noDamage_d|_d)"))
+#edit damage rate and is.damaged columns to increase readability
+simData.Files$damageRate <- gsub("-", ".", simData.Files$damageRate)
+simData.Files <- simData.Files %>% mutate(is.damaged = str_replace(is.damaged, "\\.b", "undamaged"), 
+                                          is.damaged = str_replace(is.damaged, "_d", "damaged"), 
+                                          is.damaged = str_replace(is.damaged, "_noDamagedamaged", "undamaged"), 
+                                          damageRate = str_replace(damageRate, "endo", "varied"))
+
+simData.Files %>% pander(caption = "Table2: Summary of length and damage profiles for each simulated file")
+
+```
+
+
+```{r varied contamination level datasets, message=FALSE}
+
+############# Varied contaminant and damage pattern ###############
+
+#these are the abundances for the endogenous bacterial genomes
+simData_endoAbundance <- read_delim("inputGenomes/bact/list", delim = "\t", col_names = FALSE, col_types = "cn") %>% 
+  set_colnames(c("species", "abundance")) %>% mutate(source = "endogenous")
+simData_endoAbundance$species <- gsub('.fna', '', simData_endoAbundance$species)
+
+#abundances for the env and cont sequences were 0.5
+envSpecies <- c("A_tumefaciens", "B_subtilis")
+labSpecies <- c("Sphingomonas_sp", "S_epidermidis")
+contAbundance <- c(0.5,0.5)
+simData_labAbundance <- data_frame(labSpecies, contAbundance) %>% set_colnames(c("species", "abundance")) %>% mutate(source = "lab")
+simData_envAbundance <- data_frame(envSpecies, contAbundance) %>% set_colnames(c("species", "abundance")) %>% mutate(source = "environment")
+
+#calcualte abundance endogenous microbial genomes when contaminant low, lowMod, mod and high
+simData_variedCont <- simData_endoAbundance %>% 
+  mutate(lowCont = abundance*0.85, lowModCont = abundance*0.6, modCont = abundance*0.35, highCont = abundance*0.1)
+#do same for envAbundance and labAbundances
+simData_variedCont <- simData_envAbundance %>% 
+  mutate(lowCont = abundance*0.1, lowModCont = abundance*0.35, modCont = abundance*0.6, highCont = abundance*0.85) %>% 
+  bind_rows(simData_variedCont)
+simData_variedCont <- simData_labAbundance %>% 
+  mutate(lowCont = abundance*0.05, lowModCont = abundance*0.05, modCont = abundance*0.05, highCont = abundance*0.05) %>% 
+  bind_rows(simData_variedCont) %>% select(-abundance)
+
+contamination_labels <- c(`lowCont` = "Low Contamination\n(85% endogenous, 5% laboratory, 10% environmental", 
+                          `lowModCont` = "Low - Moderate Contamination\n(60% endogenous, 5% laboratory, 35% environmental)", 
+                          `modCont` = "Moderate Contamination\n(35% endogenous, 5% laboratory, 35% environmental)", 
+                          `highCont` = "High Contamination\n(10% endogenous, 5% laboratory, 35% environmental")
+  
+#melt this dataframe and plot with facet_wrap to show how proportion of species changes in these simulated dataSets
+simData_variedCont %>% melt(id.vars = c("species", "source")) %>% 
+  ggplot(aes(x=species, y=value, fill=source)) + 
+  geom_bar(stat = "identity", position = position_dodge()) + 
+  facet_wrap(~variable, scales = "free_y", labeller = as_labeller(contamination_labels)) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1), legend.position = "top") + 
+  scale_fill_manual(values = c("#FF3333", "#009900", "#3333FF"), 
+                    name = "", 
+                    breaks=c("endogenous", "environment","lab"), 
+                    labels=c("Endogenous oral bacteria     ", "Environmental contaminant     ", "Laboratory contaminant     ")) +
+  labs(x="", y="Abundance")
+
+```
+
+## Methods
+
+Simulated datasets were aligned to an index containing 30 microbial genomes. A table listing genomes in the alignment index is provided below. 
+
+```{r index genomes, message=FALSE}
+
+#import data for index_genomes from genomeList.txt file
+index_genomes <- read_delim("expandedGenomeList.txt", delim = "\t", col_names = FALSE, col_types = "c--ccc--") %>% 
+  set_colnames(c("species", "refSeqID", "phylum", "cellType"))
+#edit values to increase readability
+index_genomes <- index_genomes %>% mutate(cellType = str_replace(cellType, "\\-", "Gram -"), 
+                                          cellType = str_replace(cellType, "\\+", "Gram +"))
+#print table
+index_genomes %>% pander(caption = "Table 3: List of reference genomes included in alignment index")
+
+```
+
+The number of TP and FP alignments for each dataset and each aligner was determined using a custom written bash script which compared the Query template NAME (containing the refSeqID for the genome from which the read was simulated) and the References sequence NAME for each alignment in the bam file. Where there was a match this was counted as a TP alignment and mismatch counted as a FP alignment. TP and FP counts for each MAPQ were written to a text file and used to calculate the proportion of TP and FP alignments for each dataset and aligner. 
+
+These steps were accomplished using the following bash script:
+
+```{bash, eval=FALSE}
+
+#!/bin/bash
+
+#Collate the number of TP and FP for each genome in each .bam file
+
+#Specify variables
+ROOTDIR=/home/a1698312/simData
+BWA_MAPDIR=$ROOTDIR/bwaMapData
+BWAMEM_MAPDIR=$ROOTDIR/bwa_memMapData
+bt2_MAPDIR=$ROOTDIR/bt2MapData
+COUNT_FILE=$ROOTDIR/map_TP_FP_counts.txt
+
+############## Create count file for storing data ###############
+
+#Generate text file for storing alignment counts
+if [ ! -f ${COUNT_FILE} ]
+then
+  echo -e "Creating ${COUNT_FILE}"
+  echo -e "count\trefID\tMAPQ" > ${COUNT_FILE}
+else
+  echo  "${COUNT_FILE} already exists"
+fi
+
+######### Counts for bwa.bam files ############
+
+#Change into directory where *bwa.bam files located
+if [ -d ${BWA_MAPDIR} ]
+then
+  echo "Changing to bwaMapData directory"
+  cd ${BWA_MAPDIR}
+else
+  echo "Cannot find ${BWA_MAPDIR}"
+exit1
+fi
+
+#Count TP and FP for each *_bwa.bam file
+for bwa_file in *_bwa.bam
+do
+  echo -e "Collating TP and FP for $bwa_file"
+  #Collate number of TP (aligned to correct genome) without quality filtering
+  TPcount=$(samtools view ${bwa_file} | awk '$1 ~ $3 {print $3, $5}' | sort | uniq -c)
+  echo -e "${bwa_file}_TP" >> ${COUNT_FILE}
+  echo -e "${TPcount}" >> ${COUNT_FILE}
+  #count number of FP (aligned to incorrect genome) without quality filtering
+  FPcount=$(samtools view ${bwa_file} | awk '$1 !~ $3 {print $3, $5}' | sort | uniq -c)
+  echo -e "${bwa_file}_FP" >> ${COUNT_FILE}
+  echo -e "${FPcount}" >> ${COUNT_FILE}
+done
+
+######### Counts for bwa_mem.bam files ############
+
+#Change into directory where *bwa.bam files located
+if [ -d ${BWAMEM_MAPDIR} ]
+then
+  echo "Changing to bwa_memMapData directory"
+  cd ${BWAMEM_MAPDIR}
+else
+  echo "Cannot find ${BWAMEM_MAPDIR}"
+exit1
+fi
+
+#Count TP and FP for each *_bwamem.bam file
+for bwamem_file in *_bwamem.bam
+do
+  echo -e "Collating TP and FP for $bwamem_file"
+  #Collate number of TP (aligned to correct genome) without quality filtering
+  TPcount=$(samtools view ${bwamem_file} | awk '$1 ~ $3 {print $3, $5}' | sort | uniq -c)
+  echo -e "${bwamem_file}_TP" >> ${COUNT_FILE}
+  echo -e "${TPcount}" >> ${COUNT_FILE}
+  #count number of FP (aligned to incorrect genome) without quality filtering
+  FPcount=$(samtools view ${bwamem_file} | awk '$1 !~ $3 {print $3, $5}' | sort | uniq -c)
+  echo -e "${bwamem_file}_FP" >> ${COUNT_FILE}
+  echo -e "${FPcount}" >> ${COUNT_FILE}
+done
+
+######### Counts for bt2.bam files ############
+
+#Change into directory where *bwa.bam files located
+if [ -d ${bt2_MAPDIR} ]
+then
+echo "Changing to bt2MapData directory"
+cd ${bt2_MAPDIR}
+else
+  echo "Cannot find ${bt2_MAPDIR}"
+exit1
+fi
+
+#Count TP and FP for each *_bwamem.bam file
+for bt2_file in *_bt2.bam
+do
+  echo -e "Collating TP and FP for $bt2_file"
+  #Collate number of TP (aligned to correct genome) without quality filtering
+  TPcount=$(samtools view ${bt2_file} | awk '$1 ~ $3 {print $3, $5}' | sort | uniq -c)
+  echo -e "${bt2_file}_TP" >> ${COUNT_FILE}
+  echo -e "${TPcount}" >> ${COUNT_FILE}
+  #count number of FP (aligned to incorrect genome) without quality filtering
+  FPcount=$(samtools view ${bt2_file} | awk '$1 !~ $3 {print $3, $5}' | sort | uniq -c)
+  echo -e "${bt2_file}_FP" >> ${COUNT_FILE}
+  echo -e "${FPcount}" >> ${COUNT_FILE}
+done
+
+```
+
+## Results
+
+To compare aligners the number of TP (aligned to genome from which the read was simulated) and FP (aligned to genome other than that from which the read was simulated) alignments for each aligner was determined and plotted as proportion of aligned reads.
+
+For this analysis, simulated datasets with variable amounts of contamination were excluded as the proportion of potential positive and negative alignments for these files would vary according to the amount of contaimination simulated.
+
+Some of the information for datasets with fixed microbial abundance is redundant (i.e. for simulated datasets of each length there are 3 damaged profiles and 3 undamaged). Only the results for the 'Real-profile_undamaged' data for each length was kept so that for each length there was 1 undamaged dataset and a 3 damaged datasets (10% deamination, 50% deamination, Real-profile). Thus a total of 20 simulated datasets were analysed and compared.
+
+
+```{r comparing TP/FP proportions of differen aligners, message=FALSE}
+
+#import data, identify fileInfo and use cumsum to give each list its own fileNo
+mapData <- read.csv("map_TP_FP_counts.txt", header = FALSE, sep = "", 
+                       skip = 1, col.names = c("count", "refID", "MAPQ")) %>%
+  mutate(bam = grepl("bam", count), fileNo = cumsum(bam))
+#extract the fileInfo and fileNo information
+fileInfo <- mapData[grep("bam", mapData$count),] %>% select(count, fileNo)
+#rejoin fileInfo as a separate variable
+mapData <- mapData %>% left_join(fileInfo, by = "fileNo") %>% select(-bam, -fileNo)
+#Extract whether data is referring to FP or TP and place in separate variable
+mapData <- colsplit(mapData$count.y, ".bam_", names = c("fileName", "countType")) %>% 
+  bind_cols(mapData) %>% select(-count.y) %>% filter(refID != "")
+#convert factor variables to character
+mapData <- mapData %>% mutate_if(is.factor, as.character)
+#convert count.x from character to numeric
+mapData$count.x <- as.numeric(mapData$count.x)
+
+#Remove data for files with variable amounts of contaminant
+mapData <- mapData %>% subset(!grepl("endo", fileName))
+
+#edit fileName to generate more concise and readable names
+editSimDataFileNames <- function(x){
+  x$fileName <- gsub('\\.b', '_undamaged', x$fileName)
+  x$fileName <- gsub('_d', '_damaged', x$fileName)
+  x$fileName <- gsub('-damage-no-adapters', '', x$fileName)
+  x$fileName <- gsub('Real-damage-profile-', 'Real-profile', x$fileName)
+  x$fileName <- gsub('no-adapters', '', x$fileName)
+  x$fileName <- gsub('-damage-ACAD-adapters', '', x$fileName)
+  x$fileName <- gsub('0-', '0.', x$fileName)
+}
+
+mapData$fileName <- editSimDataFileNames(mapData)
+
+########### import known data ##########
+
+#import data about genomes in the alignment index
+index_genomeData <- read_delim("expandedGenomeList.txt", delim = "\t", col_names = FALSE, col_types = "ccccccn-") %>% 
+  set_colnames(c("species", "taxon", "source", "refID", "genus", "cellType", "GC"))
+
+#import data about genomes in simData
+simFiles_genomeData <- read_csv("simFiles_genomeData.csv", skip = 1, col_names = FALSE, col_types = "c-n-c-ccnc") %>% 
+  set_colnames(c("taxon", "abundance", "genus", "species", "source", "GC", "in_index"))
+
+#create a dataframe with species name and refID for species with multiple refID's
+refID <- data_frame(species = c("S.epidermidis", "S.epidermidis", "S.epidermidis", "S.epidermidis", 
+                                "S.epidermidis", "S.epidermidis", "S.epidermidis", "S.roseum", 
+                                "S.roseum", "P.intermedia", "P.intermedia", "E.saphenum"), 
+                    refID = c("NC_004461.1", "NC_005008.1", "NC_005007.1", "NC_005006.1", 
+                              "NC_005005.1", "NC_005004.1", "NC_005003.1", "NC_013595.1", 
+                              "NC_013596.1", "NZ_CP019300.1", "NZ_CP019301.1", "NZ_GG688422.1"))
+#bind this to info extracted from index_genomeData
+refID <- index_genomeData %>% select(species, refID) %>% 
+  filter(!species %in% c("S.epidermidis", "S.roseum", "P.itermedia", "E.saphenum")) %>% 
+  bind_rows(refID)
+
+#left_join this info to bwaMapData
+mapData <- left_join(mapData, refID, by = "refID")
+
+#replace missing values with M.oralis
+mapData$species[is.na(mapData$species)] <- "M.oralis"
+
+################ Calculate total TP, TN, FP for all files ###################
+
+#calculate the number of TP and TN from the abundances of simFiles_genomeData
+expected_TP <- simFiles_genomeData %>% 
+  filter(in_index == "TRUE") %>% 
+  select(abundance, species, source, in_index) %>% 
+  mutate(expectedCount = abundance * 1500000)
+expected_TN <- simFiles_genomeData %>% 
+  filter(in_index == "FALSE") %>% 
+  select(abundance, species, source, in_index) %>% 
+  mutate(expectedCount = abundance * 1500000)
+#generate a dataframe containing total expected counts
+total_P_N <- data_frame(expected_TP = sum(expected_TP$expectedCount), expected_TN = sum(expected_TN$expectedCount))
+#Split the mapData according to fileName and countType then sum the TP and FP for each file
+total_TP_FP <- mapData %>% 
+  split(f = .$fileName) %>% 
+  lapply(function(x){x %>% split(f = .$countType) %>% lapply(function(z){sum(z$count.x)}) %>% 
+      bind_rows()}) %>% 
+  bind_rows(.id = "fileName") 
+
+#extract aligner used from fileName
+total_TP_FP <- total_TP_FP %>% mutate(aligner = str_extract(fileName, "(bwamem|bt2|bwa)"), 
+                                              fileName = str_replace(fileName, "_(bwamem|bt2|bwa)", ""))
+
+#split fileName and plot, facetting by simulated read length
+total_TP_FP <- colsplit(total_TP_FP$fileName, "_", c("length", "damageRate", "damageType")) %>% 
+  bind_cols(total_TP_FP) %>% arrange(., damageType) 
+#convert fileName to factor to prevent re-ordering when plotting
+total_TP_FP$fileName <- factor(total_TP_FP$fileName, levels=unique(total_TP_FP$fileName))
+
+#generate vector with aligner labels for facet_grid
+aligner_names <- c(
+  `bt2` = "Bowtie 2\n(default)",
+  `bwa` = "BWA\n(aDNA parameters)",
+  `bwamem` = "BWA-MEM\n(default)"
+)
+
+#create labels for lengths
+length_labels <- c(`30bp` = "30bp", `50bp` = "50bp", `70bp` = "70bp", 
+                   `90bp` = "90bp", `Empirical` = "Empirical length\ndistribution")
+
+#Remove data for additional undamaged files (_0.1/0.5_undamaged)
+new_total_TP_FP <- total_TP_FP %>% filter(!grepl("_0.._undamaged", fileName))
+
+#Attempt above plot again but this time calculate proportion of TP/total reads and FP/total reads??
+new_total_TP_FP %>% mutate(prop_TP = TP/1500000, prop_FP = FP/1500000) %>%
+  select(fileName, aligner, length, prop_TP, prop_FP) %>%  
+  melt(id.vars = c("fileName", "aligner", "length")) %>% 
+  ggplot(aes(x=fileName, y=value, fill=variable)) + 
+  geom_bar(stat = "identity", position = position_stack(reverse = TRUE)) + 
+  theme_bw() + 
+  scale_fill_manual(values = c("#3399FF", "#FF6666"), name="", 
+                    labels = c("True positive", "False positive")) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) + 
+  facet_grid(aligner~length, scales = "free_x", space = "free_x", 
+             labeller = labeller(aligner = aligner_names, length = length_labels)) +  
+  labs(x="", y="Proportion of reads")
+
+```
+
+Looking at the proportion of TP and FP alignments for simulated datasets with fixed abundance reveals that while Bowtie2 produces fewer false positive hits, it also has lower recall than the other two aligners, identifying less than two thirds of the actual true positive hits in the sample. BWA-MEM produces similar results to BWA except that it is less able to identify true hits when reads have short lenths (30bp). It also demonstrates slightly higher FP counts than BWA.
+
+To see if MAPQ filtering can reduce the number of FP alignments, the proportion of TP and FP alignments for each simulated file with fixed species abundance was re-calculated at different MAPQ score cut-offs and plotted.
+
+```{r proportion TP/FP at different MAPQ, message=FALSE}
+
+#create a function to calculate TP/FP/FN/TN at various MAPQ filters
+calculate_trueConditions <- function(df, ...) {
+  df <- df %>% split(f = .$fileName) %>% 
+    lapply(function(x){x %>% 
+        split(f = .$countType) %>% 
+        lapply(function(z){sum(z$count.x)}) %>% 
+        bind_rows()}) %>% 
+    bind_rows(.id = "fileName")
+  df <- df %>% mutate(TN = (780000-FP))
+  df <- df %>% mutate(FN = (720000-TP))
+  return(df)
+}
+
+#apply function to MAPQ data without filtering
+#trueCondData2 <- filter(mapData, grepl("bwamem", fileName)) %>% calculate_trueConditions() %>% mutate(MAPQ = 0)
+prop_TP_FP_byMAPQscore <- mapData %>% calculate_trueConditions() %>% mutate(MAPQ = 0)
+
+
+#create loop function to pass dataframe through trueCond.data function at varying MAPQ cut-offs
+trueCond.data <- function(df, na.rm = TRUE, ...){
+  
+  #create a vector with MAPQ scores to filter by
+  loop_count <- c(5,10,15,20,25,30,35,40,45,50,55)
+  
+  # create for loop to filter data based on MAPQ 
+  for (i in seq_along(loop_count)) {
+    
+    prop_TP_FP_byMAPQscore <- filter(df, MAPQ >= loop_count[i] ) %>% 
+      calculate_trueConditions() %>% 
+      mutate(MAPQ = loop_count[i] ) %>% 
+      bind_rows(prop_TP_FP_byMAPQscore)
+  }
+
+  return(prop_TP_FP_byMAPQscore)
+  
+}
+
+#apply trueCond.data function
+#trueCondData2 <- trueCond.data(mapData)
+prop_TP_FP_byMAPQscore <- trueCond.data(mapData)
+
+#extract aligner from fileName
+prop_TP_FP_byMAPQscore <- prop_TP_FP_byMAPQscore %>% 
+  mutate(aligner = str_extract(fileName, "(bwamem|bt2|bwa)"), 
+         fileName = str_replace(fileName, "_(bwamem|bt2|bwa)", ""))
+#extract length from fileName and place in separate variable
+prop_TP_FP_byMAPQscore <- prop_TP_FP_byMAPQscore %>% 
+  mutate(length = str_extract(fileName,"(30bp|50bp|70bp|90bp|Empirical)"), 
+         fileName = str_replace(fileName, "(30bp|50bp|70bp|90bp|Empirical)_", ""))
+
+damage_labels <- c(`0.1_damaged` = "0.1 deamination",
+                   `0.5_damaged` = "0.5 deamination",
+                   `Real-profile_damaged` = "LaBrana profile",
+                  `Real-profile_undamaged` = "No damage")
+
+#Generate a df with titles for the following plots and bind to test
+plot_labels <- data_frame(length = c("30bp","50bp","70bp","90bp","Empirical"), 
+                          labels = c("Simulated read length - 30bp", "Simulated read length - 50bp", 
+                                     "Simulated read length - 70bp", "Simulated read length - 90bp", 
+                                     "Simulated read length - Empirical length distribution"))
+
+prop_TP_FP_byMAPQscore <- left_join(prop_TP_FP_byMAPQscore, plot_labels, by = "length")
+
+#Plot prop TP/FP by MAPQ (run as a loop to filter through the different simulated lengths)
+prop_TP_FP_byMAPQscore %>% mutate(prop_TP = TP/1500000, prop_FP = FP/1500000) %>% 
+  filter(!grepl("0.._undamaged", fileName)) %>% 
+  split(f = .$length) %>% lapply(function(x){x %>%
+  select(fileName, MAPQ, aligner, labels, prop_FP, prop_TP) %>% 
+  melt(id.vars = c("fileName", "MAPQ", "aligner", "labels")) %>% 
+  ggplot(aes(x=MAPQ, y=value, fill=variable)) + 
+    geom_bar(stat = "identity") + 
+    facet_grid(fileName~aligner, scales = "free_x", space = "free_x", 
+               labeller = labeller(aligner = aligner_names, fileName = damage_labels)) + 
+    scale_fill_manual(values = c("#FF6666", "#3399FF"), name="", breaks = c("prop_TP", "prop_FP"), 
+                      labels = c("True positive", "False positive")) + 
+    labs(x="MAPQ cut-off", y="Proportion of total reads", title=x$labels)})
+
+
+```
+
+For BWA there is clearly a greater number of FP alignments observed for short read lengths (30bp), while BWA-MEM demonstrates a higher proportion of FP when reads are 70bp in length. Bowtie2 continues to demonstrate lower FP rate but also much lower recall.
+
+Filtering by MAPQ score can decrease the proportion of FP reads. For BWA there is a decrease from beteen 0-5, another decrease in FP hits when MAPQ 25 is applied and the smallest proportion of FP when a MAPQ cut-off of 30 is applied. For BWA-MEM There is a steady reduction in FP rate with increasing MAPQ score, but no particular MAPQ cut-off stands out. 
+
+It is important to note that increasing the MAPQ cut-off also decreases the number of TP alignments and thus the amount of data available for analysis.
+
+To better compare aligners, a TPR and FPR was calculated at multiple MAPQ cut-offs and plotted against each other.
+
+```{r ROC curves, message=FALSE}
+
+#create a function to calculate TP/FP/FN at various MAPQ filters
+calculate_TPR_FPR <- function(df, ...) {
+  df <- df %>% split(f = .$fileName) %>% 
+    lapply(function(x){x %>% 
+        split(f = .$countType) %>% 
+        lapply(function(z){sum(z$count.x)}) %>% 
+        bind_rows()}) %>% 
+    bind_rows(.id = "fileName")
+  df <- df %>% mutate(TN = (780000-FP))
+  df <- df %>% mutate(FN = (720000-TP))
+  df <- df %>% mutate(TPR = (TP / (TP + FN)), FPR = (FP / (TN + FP)))
+  return(df)
+}
+
+#apply function to bwaMapData at various MAPQ filters and collate into one object
+roc_data <- mapData %>% calculate_TPR_FPR() %>% mutate(MAPQ = 0)
+
+#Create a loop to filter and cumsum results at each MAPQ cutoff
+roc.data <- function(df, na.rm = TRUE, ...){
+
+  # create for loop to filter data based on MAPQ 
+  for (i in 0:59) {
+    
+    roc_data <- filter(df, MAPQ > i) %>% 
+      calculate_TPR_FPR() %>% 
+      mutate(MAPQcutoff = i) %>% 
+      bind_rows(roc_data)
+    
+  }
+  
+  return(roc_data)
+  
+}
+
+#apply roc.data function to mapData
+roc_data <- roc.data(mapData)
+
+#extract aligner used from fileName
+roc_data <- roc_data %>% mutate(aligner = str_extract(fileName, "(bwamem|bt2|bwa)"), 
+                                fileName = str_replace(fileName, "_(bwamem|bt2|bwa)", ""))
+
+roc_data %>% 
+  filter(!grepl("_..._undamaged", fileName)) %>% 
+  split(f = .$fileName) %>% lapply(function(x){x %>% 
+  ggplot(aes(x=FPR, y=TPR, colour=aligner)) + 
+  geom_line() + 
+  geom_point() + 
+  theme_bw() + 
+  facet_wrap(~fileName) + 
+  scale_colour_manual(values = c(palette3), name="Aligner", 
+                      labels=c("bowtie2 (default)", "bwa (no seed; gap 2;\nrelax edit dist.)", "bwa-mem (default)")) +
+  theme(legend.text = element_text(size = 8), legend.title = element_text(size = 10), legend.position = c(0.8,0.2)) + 
+  labs(x="False Positive Rate ( FP / (TN + FP) )", y="True Positive Rate ( TP / (TP + FN) )")})
+
+```
+
+
+```{r TPR/FPR for key MAPQ scores, message=FALSE}
+
+#plot each aligner in different colour
+roc_data %>% 
+  filter(MAPQcutoff %in% c(0,5,10,20,25,30)) %>% 
+  filter(!grepl("_..._undamaged", fileName)) %>% 
+  ggplot(aes(x=FPR, y=TPR, colour=aligner, shape=factor(MAPQcutoff))) + 
+  geom_point(size=3) + 
+  facet_wrap(~fileName, ncol = 4) + 
+  scale_x_continuous(limits = c(0,1)) + 
+  scale_shape_manual(values = c(1,2,3,4,5,6), name="MAPQ cutoff") + 
+  scale_colour_manual(values = c(palette3), name="Aligner", 
+                      labels=c("bowtie2\n(default)", "bwa (no seed;\ngap 2; relax edit dist.)", "bwa-mem\n(default)")) + 
+  labs(x="False Positive Rate ( FP / (TN + FP) )", y="True Positive Rate ( TP / (TP + FN) )") + 
+  theme(legend.text = element_text(size = 8), legend.title = element_text(size = 10), 
+        strip.text.x = element_text(size = 8))
+
+#Repeat above plot but using lapply to get larger plot for each fileName
+roc_data %>% 
+  filter(MAPQcutoff %in% c(0,5,10,20,25,30)) %>% 
+  filter(!grepl("_..._undamaged", fileName)) %>% 
+  split(f = .$fileName) %>% lapply(function(x){x %>% 
+  ggplot(aes(x=FPR, y=TPR, colour=aligner, shape=factor(MAPQcutoff))) + 
+  geom_point(size=3) + 
+  facet_wrap(~fileName) + 
+  scale_x_continuous(limits = c(0,0.5)) + 
+  theme(legend.position = c(0.8,0.5)) + 
+  scale_shape_manual(values = c(1,2,3,4,5,6), name="MAPQ cutoff") + 
+  scale_colour_manual(values = c(palette3), name="Aligner", 
+                      labels=c("bowtie2 (default)", "bwa (no seed; gap 2; relax edit dist.)", "bwa-mem (default)")) + 
+  labs(x="False Positive Rate ( FP / (TN + FP) )", y="True Positive Rate ( TP / (TP + FN) )") + 
+  theme(legend.text = element_text(size = 8), legend.title = element_text(size = 10))})
+```
+
+The FPR reported for these aligners could in fact be an overestimation as any read which aligned but was simulated from a genome other than the genome in the alignment index was considered a false positive. In some instances the simulated dataset contained multiple strains of a particular species, only 1 of which was included in the alignment index. Therefore, reads generated from the same species but a different strain are counted as false positives.
+
+Time to complete alignments also needs to be considered.
+
+```{r Time to complete alignment, message=FALSE}
+
+############### time to complete alignment #############################
+
+#import mapDamageLog.txt data
+logData <- read_delim("mapDamageLog.txt", delim = "\t", skip = 2, 
+           col_names = FALSE, col_types = "ccn", n_max = 134) %>% 
+  set_colnames(c("aligner", "fileName", "time")) %>% na.omit()
+
+#calculate average alignment time for each aligner
+mean_alnTime <- logData %>% 
+  split(f = .$aligner) %>% 
+  lapply(function(x){mean(x$time)}) %>% 
+  bind_rows()
+
+#convert seconds to min and round
+mean_alnTime <- as_tibble(cbind(nms = names(mean_alnTime), t(mean_alnTime))) %>% #transpose object
+  set_colnames(c("aligner", "mean_time_sec")) %>% # set column names
+  mutate_each(funs(as.numeric), starts_with("mean")) %>% #convert mean from character to numeric
+  mutate(mean_time_min = sprintf("%0.2f", mean_time_sec/60)) %>% # calculate running time in minutes, rounding to 2 dec.
+  mutate_each(funs(as.numeric), starts_with("mean_"))
+
+#plot time comparison in minutes
+mean_alnTime %>% 
+  ggplot(aes(x=aligner, y=mean_time_min, fill=aligner)) + 
+  geom_bar(stat = "identity") + 
+  theme_bw() + 
+  guides(fill=FALSE) + 
+  labs(x="", y="Mean time (mins)", title="Mean time to align simulate files (1.5 million reads per file)") + 
+  scale_x_discrete(labels = c("Bowtie2\n(default)", "BWA\n(no seed; max gap 2;\nmax edit dist. 0.01)", "BWA-MEM\n(default)"))
+
+```
+
+To investigate more closely when and where mis-alignment is occuring files aligned with BWA were sorted and deduplicated before being split according to the genome to which reads aligned. To identify from which reference genomes the aligned reads originated from a bash script was written to extract the readID for each alignment with a quality score at or equal to 25 and count the number of unique readID's. 
+
+```{bash eval=FALSE}
+
+#!/bin/bash
+
+# List and count readID in each _split.bam file
+#     to identify from which genomes aligned reads belong
+
+#Specify variables
+ROOTDIR=/home/a1698312/simData
+BWA_MAPDIR=$ROOTDIR/bwaMapData
+BWAMEM_MAPDIR=$ROOTDIR/bwa_memMapData
+bt2_MAPDIR=$ROOTDIR/bt2MapData
+COUNT_FILE=$ROOTDIR/mapped_readID_counts.txt
+
+############## Create count file for storing data ###############
+
+#Generate text file for storing alignment counts
+if [ ! -f mapped_readID_counts.txt ]
+then
+  echo -e 'Creating file mapped_readID_counts.txt'
+  echo -e 'count\treadID' > mapped_readID_counts.txt
+else
+  echo  'mapped_readID_counts.txt already exists'
+fi
+
+######### Counts for split.bam files ############
+
+#Change into directory where *bwa.bam files located
+if [ -d ${BWA_MAPDIR} ]
+then
+echo "Changing to bwaMapData directory"
+cd ${BWA_MAPDIR}
+else
+  echo "Cannot find ${BWA_MAPDIR}"
+exit1
+fi
+
+#Count number of reads for each readID within each *_split.bam file at MAPQ of 25 and 30
+for split_file in *_d_*_split.bam
+do
+  #Collate number of each readID using -q filter of 25
+  echo -e "Collating readID's for $split_file"
+  READ_ID_COUNT1=$(samtools view -q 25 ${split_file} | awk -F: '{print $1}' | sort | uniq -c)
+  echo -e "${split_file}_MAPQ_25" >> ${COUNT_FILE}
+  echo -e "${READ_ID_COUNT1}" >> ${COUNT_FILE}
+  #Collate number of each readID using -q filter of 30
+  echo -e "Collating readID's for $split_file"
+  READ_ID_COUNT2=$(samtools view -q 30 ${split_file} | awk -F: '{print $1}' | sort | uniq -c)
+  echo -e "${split_file}_MAPQ_30" >> ${COUNT_FILE}
+  echo -e "${READ_ID_COUNT2}" >> ${COUNT_FILE}
+done
+
+
+```
+
+The text file with mapped_readID counts was imported into R and this data used to calculate the proportion of each genome from which reads were simulated that was aligning to genomes in the alignment index. The proportion of True Hits (alignment of a read simulated from the same species (regardless of strain)) and Spurious Hits (alignment of a read simulated from a different species) was calculated and plotted.
+
+```{r to what species does reads in each aligned file actually belong, message=FALSE}
+
+############To which genomes do reads in split.bam actually belong?? ##############
+
+#import mapped_readID_counts.txt data
+readIDCount <- read.csv(file="mapped_readID_counts.txt", 
+                     sep="", skip = 1, header = FALSE, 
+                     col.names = c("count", "readID")) %>% 
+  mutate(bam = grepl("bam", count), fileNo = cumsum(bam))
+
+#extract the fileInfo and fileNo information
+fileInfo <- readIDCount[grep("bam", readIDCount$count),] %>% select(count, fileNo)
+
+#rejoin fileInfo as a separate variable
+readIDCount <- readIDCount %>% left_join(fileInfo, by = "fileNo") %>% 
+  select(-bam, -fileNo) %>% 
+  set_colnames(c("count", "refSeqID", "fileName")) %>% 
+  filter(refSeqID != "")
+#convert factor variables to character
+readIDCount <- readIDCount %>% mutate_if(is.factor, as.character)
+#convert splitCount from character to numeric
+readIDCount$count <- as.numeric(readIDCount$count)
+
+#Extract MAPQ from fileName
+readIDCount <- readIDCount %>% mutate(MAPQ = str_extract(fileName, "MAPQ_(25|30)"), 
+                                      fileName = str_replace(fileName, "_MAPQ_(25|30)", ""))
+
+#as all files have the '_d_' before the genome, split with this
+readIDCount$fileName <- gsub('_split.bam', '', readIDCount$fileName)
+readIDCount <- colsplit(readIDCount$fileName, "_d_", names = c("simFileName","alignedGenome")) %>% 
+  bind_cols(readIDCount) %>% select(-fileName) %>% 
+  set_colnames(c("fileName", "alignedGenome", "count", "refSeqID", "MAPQ"))
+
+#Replace the readID with the species name
+
+#import refSeqID info
+simGenomes_refSeqIDs <- read.csv("refSeqID_genomes_for_simDataSets.csv", sep = ",", 
+                                 skip = 1, header = FALSE, 
+                                 col.names = c("originalStrain","originalSpecies","GC","refSeqID"), 
+                                 colClasses = c("character","character","numeric","character"))
+#left_join this info to readIDCount
+readIDCount <- left_join(readIDCount, simGenomes_refSeqIDs, by = "refSeqID")
+
+#generate a function edit simDataFileNames to generate more concise and readable names
+
+#USE: df$fileName <- editFileNames(df)
+
+editSimDataFileNames <- function(x){
+  x$fileName <- gsub('.bam', '', x$fileName)
+  x$fileName <- gsub('\\.b', '_undamaged', x$fileName)
+  x$fileName <- gsub('_d', '_damaged', x$fileName)
+  x$fileName <- gsub('-damage-no-adapters', '', x$fileName)
+  x$fileName <- gsub('Real-damage-profile-', 'Real-profile', x$fileName)
+  x$fileName <- gsub('no-adapters', '', x$fileName)
+  x$fileName <- gsub('-damage-ACAD-adapters', '', x$fileName)
+  x$fileName <- gsub('0-', '0.', x$fileName)
+  x$fileName <- gsub('_noDamage_damaged', '_undamaged', x$fileName)
+  x$fileName <- gsub('_withDamage', '', x$fileName)
+  x$fileName <- gsub('_Real-profile_undamaged', '_undamaged', x$fileName)
+  x$fileName <- gsub('endo-0.1_lab-0.05_env-0.85', 'high-contamination', x$fileName)
+  x$fileName <- gsub('endo-0.35_lab-0.05_env-0.6', 'moderate-contamination', x$fileName)
+  x$fileName <- gsub('endo-0.6_lab-0.05_env-0.35', 'low-moderate-contamination', x$fileName)
+  x$fileName <- gsub('endo-0.85_lab-0.05_env-0.1', 'low-contamination', x$fileName)
+  x$fileName <- gsub('endo_0.85_lab_0.05_env_0.10', 'low-contamination', x$fileName)
+}
+
+#edit simData fileNames
+readIDCount$fileName <- editSimDataFileNames(readIDCount)
+
+#collate total for each split.bam file and use to calcualte proportion of reads
+totalReadIDCount <- readIDCount %>% split(f = .$fileName) %>% lapply(function(x){x %>% 
+  split(f = .$alignedGenome) %>% 
+  lapply(function(y){y %>% split(f = .$MAPQ) %>% 
+      lapply(function(z){z %>% summarise(sum(count))}) %>% 
+      bind_rows(.id = "MAPQ")}) %>% 
+  bind_rows(.id = "alignedGenome")}) %>% 
+  bind_rows(.id = "fileName")
+
+readIDCount <- left_join(readIDCount, totalReadIDCount, by = c("alignedGenome", "MAPQ", "fileName")) %>% 
+  mutate(prop = count/`sum(count)`)
+
+#replace A.actinomyces in alignedGenome with A.actinomycetemcomitans (as it should be)
+readIDCount <- readIDCount %>% 
+  mutate(alignedGenome = str_replace(alignedGenome, "A.actinomyces", "A.actinomycetemcomitans"))
+
+## summarise proportion of original species being assigned to each genome for each file
+
+reducedReadIDCount <- readIDCount %>% filter(MAPQ == "MAPQ_25") %>% 
+  select(fileName, alignedGenome, originalSpecies, prop) %>% 
+  split(f = .$fileName) %>% 
+  lapply(function(x){x %>% select(-fileName) %>% split(f = .$alignedGenome) %>% 
+      lapply(function(z){z %>% select(-alignedGenome) %>% group_by(originalSpecies) %>% 
+          summarise_each(funs(sum))}) %>% 
+      bind_rows(.id = "alignedGenome")}) %>% 
+  bind_rows(.id = "fileName") %>% mutate(perc = round(prop*100, digits = 1))
+
+##filter out spurious alignments??
+reducedReadIDCount <- mutate(reducedReadIDCount, 
+       alignment = ifelse(alignedGenome == originalSpecies, "True Hit", "Spurious Hit"))
+
+#plot prop True Hit against Spurious Hit against aligned genome
+reducedReadIDCount %>% filter(!grepl("contamination", fileName)) %>% 
+  ggplot(aes(x=alignedGenome, y=perc, fill=alignment)) + 
+  geom_bar(stat = "identity") + 
+  facet_wrap(~fileName, ncol=3) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1, size = 11, face = "italic"), 
+        legend.text = element_text(size = 12), strip.text = element_text(size = 12), 
+        axis.title.y = element_text(size = 12)) +
+  scale_fill_manual(values = c("#3399FF", "#FF6666")) +
+  labs(x="", y="% of aligned reads", fill="")
+  
+```
+
+The following table summarises genomes to which more than 10% of the reads aligned are spurious alignments.
+
+```{r table summarising % originating species for each alignment, message=FALSE}
+
+reducedReadIDCount %>% filter(alignment == "Spurious Hit") %>% select(-alignment, -perc, -originalSpecies) %>% split(f = .$fileName) %>% lapply(function(x){x %>% select(-fileName) %>% group_by(alignedGenome) %>% summarise_each(funs(sum)) %>% filter(prop > 0.10)}) %>% bind_rows(.id = "fileName") %>% mutate(prop = round(prop*100, digits = 1)) %>% dcast(fileName ~ alignedGenome) %>% pander(caption="Summary of genomes to which more than 10% of the aligned reads are spurious hits", split.table = 100)
+
+```
+
+Mis-alignment occurs more frequently for short read lengths (30bp), an understandable result given that shorter DNA sequences are less unique and more likely to align to multiple divergent species given the propensity for sequence conservation between microbial genomes. For all other simulated datafiles with damage only L.buccalis, S.gordonii, S.mitis and S.roseum have more than 10% of the aligned reads representing spurius alignment. If we plot the proportion of originating species aligning to each of these genomes we observe the following:
+
+```{r what reads are being mis-aligned, message=FALSE}
+
+reducedReadIDCount %>% filter(grepl("30bp", fileName)) %>% 
+  filter(alignedGenome %in% c("A.actinomycetemcomitans", "A.oris", "H.influenza", "L.buccalis",
+                              "P.propionicum", "S.gordonii", "S.mitis", "S.roseum", "S.sanguinis")) %>% 
+  filter(prop > 0.01) %>% 
+    ggplot(aes(x=alignedGenome, y=prop, fill=originalSpecies)) + 
+    geom_bar(stat = "identity", colour="white") + 
+    facet_wrap(~fileName) + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) +
+    labs(x="", y="proportion of aligned reads", fill="Originating Species") + 
+    scale_fill_manual(values = c("A.actinomycetemcomitans" = "#E41A1C",
+                               "A.aphrophilus" = "#3333FF",
+                               "A.oris" = "#459E6F", 
+                               "A.oral" = "#DA5724",
+                               "A.tumeficiens" = "#89C5DA",
+                               "C.oral" = "#D87085",
+                               "L.buccalis" = "#B43547",
+                               "L.oral" = "#3983AC",
+                               "P.dentalis" = "#85658D", 
+                               "S.cirstatus" = "#B292A3",
+                               "S.mitis" = "#3F908E",
+                               "S.oralis" = "#6DDE88",
+                               "Sphigomonas.species" = "#D0A72D",
+                               "S.sanguinis" = "#AB5832",
+                               "V.parvula" = "#9B4F9D")) +   
+    geom_text(aes(label=perc), position = position_stack(vjust = 0.5), colour="black", size=3)
+
+reducedReadIDCount %>% filter(!grepl("30bp", fileName)) %>% filter(!grepl("contamination", fileName)) %>% 
+  filter(alignedGenome %in% c("L.buccalis", "P.propionicum", "S.gordonii", "S.mitis")) %>% 
+  filter(prop > 0.01) %>% 
+    ggplot(aes(x=alignedGenome, y=prop, fill=originalSpecies)) + 
+    geom_bar(stat = "identity", colour="white") + 
+    facet_wrap(~fileName) + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) +
+    labs(x="", y="proportion of aligned reads", fill="Originating Species") + 
+    scale_fill_manual(values = c("A.actinomycetemcomitans" = "#E41A1C",
+                               "A.aphrophilus" = "#3333FF",
+                               "A.oris" = "#459E6F", 
+                               "A.oral" = "#DA5724",
+                               "A.tumeficiens" = "#89C5DA",
+                               "C.oral" = "#D87085",
+                               "L.buccalis" = "#B43547",
+                               "L.oral" = "#3983AC",
+                               "P.dentalis" = "#85658D", 
+                               "S.cirstatus" = "#B292A3",
+                               "S.mitis" = "#3F908E",
+                               "S.oralis" = "#6DDE88",
+                               "Sphigomonas.species" = "#D0A72D",
+                               "S.sanguinis" = "#AB5832",
+                               "V.parvula" = "#9B4F9D")) +  
+    geom_text(aes(label=perc), position = position_stack(vjust = 0.5), colour="black", size=3)
+
+reducedReadIDCount %>% filter(!grepl("30bp", fileName)) %>% filter(grepl("contamination", fileName)) %>% 
+  filter(alignedGenome %in% c("L.buccalis", "P.propionicum", "S.gordonii", "S.mitis")) %>% 
+  filter(prop > 0.01) %>% 
+    ggplot(aes(x=alignedGenome, y=prop, fill=originalSpecies)) + 
+    geom_bar(stat = "identity", colour="white") + 
+    facet_wrap(~fileName) + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) +
+    labs(x="", y="proportion of aligned reads", fill="Originating Species") + 
+    scale_fill_manual(values = c("A.actinomycetemcomitans" = "#E41A1C",
+                               "A.aphrophilus" = "#3333FF",
+                               "A.oris" = "#459E6F", 
+                               "A.oral" = "#DA5724",
+                               "A.tumeficiens" = "#89C5DA",
+                               "C.oral" = "#D87085",
+                               "L.buccalis" = "#B43547",
+                               "L.oral" = "#3983AC",
+                               "P.dentalis" = "#85658D", 
+                               "S.cirstatus" = "#B292A3",
+                               "S.mitis" = "#3F908E",
+                               "S.oralis" = "#6DDE88",
+                               "Sphigomonas.species" = "#D0A72D",
+                               "S.sanguinis" = "#AB5832",
+                               "V.parvula" = "#9B4F9D")) + 
+    geom_text(aes(label=perc), position = position_stack(vjust = 0.5), colour="black", size=3)
+
+```
+
+To better understand where misassignment is occuring and why, counts were made of the ReadID in split bam files and used to calculate the proportion of originating species that was aligning to each genome in the alignment index. These were then plotted as pie-charts for a given simulated data set and summarised for all data sets. The plots below are for the '70bp_0.5_damage' simulated dataset after MAPQ filtering with a score of 25. For improved clarity any originalSpeices that make up less than 1% of the reads in each split bam file have been removed. 
+
+```{r proportion of originalSpecies in each aligned file, message=FALSE}
+
+#Create a blank theme to be applied to pie charts
+blank_theme <- theme_minimal()+
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.border = element_blank(),
+    panel.grid=element_blank(),
+    axis.ticks = element_blank(),
+    axis.text.x = element_blank(),
+    plot.title=element_text(size=14, face="plain", hjust = 0.5),
+    plot.subtitle=element_text(size=12, face="plain", hjust = 0.5),
+    legend.title = element_text(size=12, face="plain", hjust = 0.5),
+    legend.title.align = 0.5,
+    legend.text=element_text(size=12, face="plain", hjust = 0.5)
+  )
+
+readIDCount %>% filter(fileName == "70bp_0.5") %>%
+  filter(MAPQ == "MAPQ_25", prop > 0.01) %>% 
+  split(f = .$alignedGenome) %>% 
+  lapply(function(x){x %>% mutate(text_y = cumsum(prop) - prop/2) %>% 
+  ggplot(aes(x="", y=prop, fill=originalStrain)) + 
+  geom_bar(stat = "identity") + 
+  coord_polar("y", start = 0) + 
+  blank_theme + 
+  guides(fill=FALSE) + 
+  scale_fill_manual(values = c("A.actinomycetemcomitans" = "#E41A1C",
+                               "A.aphrophilus" = "#3333FF",
+                               "A.oris" = "#459E6F",
+                               "Actinomyces.species.oral" = "#DA5724",
+                               "A.tumeficiens" = "#B75D70",
+                               "B.subtilis.BSn5" = "#89C5DA",
+                               "C.haemolytica" = "#3F4921",
+                               "Capnocytophaga.species.oral" = "#FFFA31",
+                               "F.nucleatum" = "#B8782A",
+                               "F.nucleatum.polymorphum" = "#D87085",
+                               "F.nucleatum.vincetii" = "#CE50CA",
+                               "L.buccalis" = "#B43547",
+                               "Leptotrichia.species.oral" = "#3983AC",
+                               "N.meningitidis" = "#4BAB51",
+                               "N.sicca" = "#85658D",
+                               "P.dentalis" = "#652926", #"#C84248",
+                               "P.denticola" = "#38333E",
+                               "P.gingivalis" = "#6DDE88",
+                               "R.dentocariosa" = "#AB5832",
+                               "R.mucilaginosa" = "#EE7CAF",
+                               "S.cirstatus" = "#B292A3",
+                               "S.epidermidis" = "#845172",
+                               "S.mitis" = "#3F908E",
+                               "S.mutans" = "#5C9A5C",
+                               "S.mutans.NN202" = "#9B4F9D",
+                               "S.oralis" = "#74D944",
+                               "Sphigomonas.species" = "#CBD588",
+                               "S.sanguinis" = "#D0A72D",
+                               "V.parvula" = "#8A7C64")) + 
+  labs(title=x$alignedGenome, subtitle=x$`sum(count)`,fill="") + 
+      geom_text(aes(label=originalStrain), position = position_stack(vjust = 0.5), colour="white", size=5)})
+
+```
