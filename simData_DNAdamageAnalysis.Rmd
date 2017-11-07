@@ -1,0 +1,973 @@
+---
+title: "Simulated Data - DNA damage analysis"
+author: "Jacqueline Rehn"
+date: "11/1/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#load packages
+library(dplyr)
+library(readr)
+library(stringr)
+library(reshape2)
+library(tibble)
+library(magrittr)
+library(ggplot2)
+library(scales)
+library(pander)
+library(gridExtra)
+
+#set aesthetics
+theme_set(theme_bw())
+palette <- c("#FF3333", "#3333FF", "#009900", "#FF9900", "#990099", 
+             "#33CCCC", "#66CC66", "#FFCC66", "#FF99CC", "#3399FF", 
+             "#FF6666", "#9966FF")
+palette15 <- c("#FF3333", 
+               "#3333FF", 
+               "#009900", 
+               "#FF9900", 
+               "#FF99CC", 
+               "#3399FF", 
+               "#66CC66", 
+               "#FFCC66", 
+               "#FF6666",
+               "#006699",
+               "#336600",
+               "#FFCC99",
+               "#FF0066",
+               "#9966FF",
+               "#33CCCC")
+
+```
+
+### Introduction
+
+Use simulated data to determine the accuracy of mapDamage pipeline for estimating damage profiles of complex metagenomic samples. 
+
+Questions to address:
+
+1. Do currently used parameters for bwa result in spurious alignments?
+2. How is the number of spurious alignments affected by:
+      - length of reads
+      - levels of deamination
+3. Does quality filtering (by MAPQ) reduce the number of spurious alignments, and if so what is an appropriate cut-off
+4. Does the presence of spurious alignments affect the estimated levels of damage for selected microbial species?
+5. Can the estimated level of damage be improved by removing from the analysis species with fewer than a specified threshold?
+
+### Methods
+
+## Damage estimation pipeline
+
+The workflow for assessing damage levels is as follows:
+
+1. Download fasta files (from NCBI) of RefSeq genomes for microbial species that have been commonly identified in dental calculus/oral microbiome
+2. Concatenate the downloaded files into a single fasta file and use to build an alignment index (bwa)
+3. Align simulated data sets against the concatenated index to produce a *bwa.bam file
+4. Sort and de-duplicate the bam files, producing a *rmdup.bam file (sambamba)
+5. Split the *_rmdup.bam file into separate bam files for each of the genomes against which thereads were aligned (samtools).
+6. Analyse the damage patterns in the *_split.bam files (mapDamage2.0).
+
+In addition, the script also generated text files containing count data for:
+
+1. The number of fasta reads in each file analysed
+2. The number of aligned reads (in the *bwa.bam file) by MAPQ score
+3. The number of remaining aligned reads after de-duplicattion (in the *rmdup.bam file) by MAPQ score
+4. The number of reads aligned to each genome (in *split.bam files) by MAPQ score
+
+Simulated datasets were aligned against an index containing 30 genomes. This list includes:
+
+
+```{r echo=FALSE}
+
+#import data for index_genomes from genomeList.txt file
+index_genomes <- read_delim("expandedGenomeList.txt", delim = "\t", col_names = FALSE, col_types = "c--ccc--") %>% 
+  set_colnames(c("species", "refSeqID", "phylum", "cellType"))
+#edit values to increase readability
+index_genomes <- index_genomes %>% mutate(cellType = str_replace(cellType, "\\-", "Gram -"), 
+                                          cellType = str_replace(cellType, "\\+", "Gram +"))
+#print table
+index_genomes %>% pander(caption = "Table 3: List of reference genomes included in alignment index")
+
+```
+
+Of these 30 genomes, only 14 are present in the simulated data sets (A.oris; A.actinomycetemcomitans; B.subtilis; F.nucleatum; L.buccalis; N.meningitidis; N.sicca; P.gingivalis; P.denticola; R.dentocariosa; S.epidermidis; S.mutans; ; S.mitis; S.sanguinis ).
+
+The bash script used to complete the above processing tasks is show below:
+
+```{bash eval=FALSE}
+
+#!/bin/bash
+
+#USAGE: Requires trimmed_fastq files in specified directory
+#       Specify variable for location of Ref Seq genomes for downloading and alignment
+
+
+#Specify variables
+ROOTDIR=/home/a1698312
+TRIMDIR=$ROOTDIR/simData/trimData
+MAPDIR=$ROOTDIR/simData/mapData
+MAPDAMAGEDIR=$ROOTDIR/simData/mapDamageData
+LOGFILE=$ROOTDIR/simData/mapDamageLog.txt
+
+##### create log file for script ####
+
+if [ ! -f mapDamageLog.txt ]
+then
+  echo -e 'Creating file mapDamageLog.txt'
+  echo -e "date\tmessage" > ${LOGFILE}
+  echo -e "$(date -u)\tStart of script" >> ${LOGFILE}
+else
+  echo -e 'mapDamageLog.txt already exists'
+  echo -e "$(date -u)\tStart of script" >> ${LOGFILE}
+fi
+
+##### bwa_build alignment index ####
+
+#Change into mapData directory
+if [ ! -d ${MAPDIR} ]
+then
+  echo "Creating ${MAPDIR}"
+  mkdir -p mapData
+  echo "Changing into ${MAPDIR}"
+  cd ${MAPDIR}
+else
+  echo "${MAPDIR} already exists. Changing into ${MAPDIR}"
+  cd ${MAPDIR}
+fi
+
+#Download fasta file for each genome in genomeList.txt file
+while read -r line
+do 
+  link=$(echo "${line}" | cut -f3)
+  echo "$link"
+  ref=$(echo "${line}" | cut -f1)
+  echo "$ref"
+  wget -c "$link" -O "${ref}".fna.gz
+done < ${ROOTDIR}/weyrich/genomeList.txt
+
+#Add time stamp to logfile
+echo -e "$(date -u)\tfasta files downloaded" >> ${LOGFILE}
+
+#unzip fasta files
+gunzip *fna.gz
+
+#concatenate fasta files
+cat *fna > combined.fna
+
+#build-index for alignment
+bwa index -p bwaidx combined.fna
+
+#Add time stamp to logfile
+echo -e "$(date -u)\tbwa index built" >> ${LOGFILE}
+
+################ BWA Alignment #################
+
+#Change into directory where trimmed_fastq files located
+if [ -d ${TRIMDIR} ]
+then
+  echo "Changing to trimData directory"
+  cd ${TRIMDIR}
+else
+  echo "Cannot find ${TRIMDIR}"
+exit1
+fi
+
+#Generate text file for storing merged count data
+if [ ! -f fastq_read_count.txt ]
+then
+  echo -e 'Creating file fastq_read_count.txt'
+  echo -e 'fileName\treadCount' > fastq_read_count.txt
+else
+  echo  'fastq count file already exists'
+fi
+
+#Count merged reads in fastq files and print to text file
+for sim_file in *fa.gz
+  do
+    echo "Counting number of merged reads in ${sim_file}"
+    MERGECOUNT=$(zcat ${sim_file} | sed -n '1~2p' | wc -l)
+    echo -e "${sim_file%%.fa.gz}\t${MERGECOUNT}" >> fastq_read_count.txt
+    echo -e "$(date -u)\tcounted reads in ${sim_file}" >> ${LOGFILE}
+  done
+
+#bwa alignment of collapsed reads
+for sim_file in *fa.gz
+do
+  echo "Aligning ${sim_file}"
+  bwa aln -n 0.01 -o 2 -l 1024 $MAPDIR/bwaidx $sim_file -0 -t 4 > ${sim_file/%.fa.gz/_MAPPED.sai}
+  echo -e "$(date -u)\tmapped ${sim_file}" >> ${LOGFILE}
+done
+
+#Convert .sai alignment file to bam format with the sam header. Exclude unmapped reads.
+for map_file in *_MAPPED.sai
+  do 
+    echo "Converting ${map_file} to bam format"
+    PREFIX=${map_file%%_MAPPED.sai}
+    bwa samse $MAPDIR/bwaidx \
+              ${PREFIX}_MAPPED.sai \
+              ${PREFIX}.fa.gz | \
+                samtools view -bSh -F0x4 -> $MAPDIR/${PREFIX}_bwa.bam
+  done
+
+
+#Remove .sai files as no longer needed
+rm *_MAPPED.sai
+
+################### sambamba sort and rmdup #####################
+
+#Change into directory where mapped_fastq files located
+if [ -d ${MAPDIR} ]
+then
+echo "Changing to mapData directory"
+cd ${MAPDIR}
+else
+  echo "Cannot find ${MAPDIR}"
+exit1
+fi
+
+#for bam_file in *_bwa.bam
+do
+  PREFIX2=${bam_file%%_bwa.bam}
+  echo "Sorting bam file for ${bam_file}"
+  sambamba sort -o ${PREFIX2}_sorted.bam ${bam_file}
+  echo -e "$(date -u)\tsorted ${bam_file}" >> ${LOGFILE}
+done
+
+#for sort_file in *_sorted.bam
+do
+  PREFIX3=${sort_file%%_sorted.bam}
+  echo "Removing duplicates ${sort_file}"
+  sambamba markdup -r ${sort_file} ${PREFIX3}_rmdup.bam 2> ${PREFIX3}_sambambaLog.txt
+  echo -e "$(date -u)\tdeduplicated ${sort_file}" >> ${LOGFILE}
+done
+
+#Remove _sorted.bam.bai files as no longer needed
+rm *_sorted.bam.bai
+#Remove _sorted.bam files as no longer needed
+rm *_sorted.bam
+
+################# split bam file ####################
+
+#use samtools view & chromosome ID to split into separate bam files
+for rmdup_file in *_rmdup.bam
+  do
+  PREFIX3=${rmdup_file%%_rmdup.bam}
+  echo -e "Splitting ${rmdup_file}"
+  samtools view -h ${rmdup_file} | awk '{if($3 != "NZ_CP014232.1" && $3 != "NC_010729.1" && $3 != "NC_004350.2" && $3 != "NC_016610.1" && $3 != "NZ_CP012196.1" && $3 != "NC_003454.1" && $3 != "NC_002967.9" && $3 != "NC_023036.2" && $3 != "NZ_GG688422.1" && $3 != "NC_000907.1" && $3 != "NC_003454.1" && $3 != "NC_013203.1" && $3 != "NC_013853.1" && $3 != "NC_017860.1" && $3 != "NC_017861.1" && $3 != "NC_003112.2"){print $0}}' | samtools view -Sb > ${PREFIX3}_M.oralis_split.bam
+    while read -r line; do 
+        chrID=$(echo "${line}" | cut -f2)
+#        echo "$chrID"
+        ref=$(echo "${line}" | cut -f1)
+#        echo "$ref"
+        samtools view -bSh ${rmdup_file} ${chrID} > ${PREFIX3}_${ref}_split.bam
+      done < ${ROOTDIR}/weyrich/chrID.txt
+      echo -e "$(date -u)\tsplit ${rmdup_file}" >> ${LOGFILE}
+  done
+
+################# count reads in each alignment file #################
+
+#Generate text file for storing alignment count data
+if [ ! -f mapped_read_count.txt ]
+then
+  echo -e 'Creating file mapped_read_count.txt'
+  echo -e "count\tMAPQ" > mapped_read_count.txt
+else
+  echo  'aligned count file already exists'
+fi
+
+#Count total number of reads in each bwa.bam, rmdup.bam, and split.bam file
+for bam_file in *.bam
+  do
+    echo "Counting reads in ${bam_file}"
+    MAPCOUNT=$(samtools view ${bam_file} | cut -f5 | sort | uniq -c)
+    echo -e "${bam_file}" >> mapped_read_count.txt
+    echo -e "${MAPCOUNT}" >> mapped_read_count.txt
+  done
+  
+#Add time stamp
+echo -e "$(date -u)\tcounted aligned reads" >> ${LOGFILE}
+
+#return to main directory
+cd ${ROOTDIR}/simData
+
+################# mapDamage #########################
+
+#Change into mapData directory
+if [ ! -d ${MAPDAMAGEDIR} ]
+then
+  echo "Creating ${MAPDAMAGEDIR}"
+  mkdir -p ~/simData/mapDamageData
+else
+  echo "${MAPDAMAGEDIR} already exists"
+fi
+
+#Run mapDamage
+for split_file in *_split.bam
+  do
+    echo "Running mapDamage on ${split_file}"
+    mapDamage --no-stats -d ${MAPDAMAGEDIR}/${split_file%%_split} -i ${split_file} -r ~/simData/mapData/combined.fna
+    echo -e "$(date -u)\tmapDamage complete ${split_file}" >> ${LOGFILE}
+  done
+
+#Add time stamp to logfile
+echo -e "$(date -u)\tEnd of script" >> ${LOGFILE}
+
+```
+
+## Results
+
+The number of reads aligning for each simulated dataset were summarised as follows:
+  
+```{r message=FALSE}
+
+#import mapped_read_count.txt data
+mapCount <- read.csv(file="bwaMapData/bwa_map_count.txt", 
+                          sep="", skip = 1, header = FALSE, 
+                          col.names = c("count", "MAPQ")) %>% 
+  mutate(bam = grepl("bam", count), fileNo = cumsum(bam))
+
+#extract the fileInfo and fileNo information
+fileInfo <- mapCount[grep("bam", mapCount$count),] %>% select(count, fileNo)
+
+#rejoin fileInfo as a separate variable
+mapCount <- mapCount %>% left_join(fileInfo, by = "fileNo") %>% 
+  select(-bam, -fileNo) %>% 
+  set_colnames(c("count", "MAPQ", "fileName")) %>% 
+  filter(MAPQ != "NA")
+#convert factor variables to character
+mapCount <- mapCount %>% mutate_if(is.factor, as.character)
+#convert splitCount from character to numeric
+mapCount$count <- as.numeric(mapCount$count)
+
+#extract data for bwa.bam and rmdup.bam files and assign to separate objects
+bwaCount <- mapCount %>% subset(grepl("_bwa.bam", fileName))
+rmdupCount <- mapCount %>% subset(grepl("_rmdup.bam", fileName))
+#edit fileNames to be identical to fastq
+bwaCount$fileName <- gsub('_bwa.bam', '', bwaCount$fileName)
+rmdupCount$fileName <- gsub('_rmdup.bam', '', rmdupCount$fileName)
+
+######Create table summarising total fastq, bwa.bam and rmdup.bam for each sample#####
+totalRmdupCount <- rmdupCount %>% 
+  select(-MAPQ) %>% 
+  group_by(fileName) %>% 
+  summarise_each(funs(sum)) %>% set_colnames(c("fileName", "nonDupCount"))
+totalBwaCount <- bwaCount %>% 
+  select(-MAPQ) %>% 
+  group_by(fileName) %>% 
+  summarise_each(funs(sum)) %>% set_colnames(c("fileName", "alnCount"))
+totalCount <- left_join(totalBwaCount, totalRmdupCount, by = "fileName") %>% 
+  mutate(fastqCount = 1500000)
+  
+##From this calculate the total number of duplicate reads identified in each sample and add to totalCount
+totalCount <- totalCount %>% mutate(dupCount = alnCount - nonDupCount)
+
+#generate a function edit simDataFileNames to generate more concise and readable names
+
+#USE: df$fileName <- editFileNames(df)
+
+editSimDataFileNames <- function(x){
+  x$fileName <- gsub('.bam', '', x$fileName)
+  x$fileName <- gsub('\\.b', '_undamaged', x$fileName)
+  x$fileName <- gsub('_d', '_damaged', x$fileName)
+  x$fileName <- gsub('-damage-no-adapters', '', x$fileName)
+  x$fileName <- gsub('Real-damage-profile-', 'Real-profile', x$fileName)
+  x$fileName <- gsub('no-adapters', '', x$fileName)
+  x$fileName <- gsub('-damage-ACAD-adapters', '', x$fileName)
+  x$fileName <- gsub('0-', '0.', x$fileName)
+  x$fileName <- gsub('_noDamage_damaged', '_undamaged', x$fileName)
+  x$fileName <- gsub('_withDamage', '', x$fileName)
+  x$fileName <- gsub('_Real-profile_undamaged', '_undamaged', x$fileName)
+  x$fileName <- gsub('endo-0.1_lab-0.05_env-0.85', 'high-contamination', x$fileName)
+  x$fileName <- gsub('endo-0.35_lab-0.05_env-0.6', 'moderate-contamination', x$fileName)
+  x$fileName <- gsub('endo-0.6_lab-0.05_env-0.35', 'low-moderate-contamination', x$fileName)
+  x$fileName <- gsub('endo-0.85_lab-0.05_env-0.1', 'low-contamination', x$fileName)
+  x$fileName <- gsub('endo_0.85_lab_0.05_env_0.10', 'low-contamination', x$fileName)
+}
+
+#apply function to totalCount df's
+totalCount$fileName <- editSimDataFileNames(totalCount)
+
+#remove repetitious data
+totalCount <- filter(totalCount, !grepl("_..._undamaged", fileName))
+totalCount <- filter(totalCount, fileName != "Empirical_low-contamination_ACADadapters_damaged")
+totalCount <- filter(totalCount, fileName != "50bp_low-contamination_undamaged")
+
+#Generate a table summarising total count data
+totalCountTable <- totalCount[,c(1,4,2,5,3)]
+names(totalCountTable) <- c("fileName", "Processed", "Aligned", "Duplicate", "Remaining")
+
+#print table to screen
+pandoc.table(totalCountTable, caption = 'Summary of count data for each sample', split.tables = 100)
+
+```
+
+As expected there are very few duplicate reads identified in the simulated data. More than 50% of the simulated dataset has aligned to the selected genomes, although for fixed datasets,  although only 48% of the reads are expected to align for the simulated datasets with fixed bacterial abundances. For datasets with variable amounts of contamination, increased contamination results in an increase in the proportion of B.subtilis reads within the sample, but a reduction in the number of endogenous sequences, many of which are represented in the alignment index. Thus fewer reads are expected to align as the level of contamination increases.
+
+```{r Number of reads aligned and unaligned, message=FALSE}
+
+
+#extract length from fileName and add as separate variable
+extractLength <- function(x){
+  x %>% mutate(length = str_extract(fileName,  "(30bp|50bp|70bp|90bp|Empirical)"))
+}
+
+#Apply function to totalCount
+totalCount <- extractLength(totalCount)
+
+###Plot number of reads aligned and unaligned for each sample with all endogenous content
+totalCount %>% select(fileName, fastqCount, alnCount, length) %>% 
+  mutate(Unaligned = fastqCount - alnCount) %>% 
+  select(-fastqCount) %>% 
+  melt(id.vars = c("fileName", "length"), variable.name = "group", value.name = "count") %>% 
+  filter(!grepl("contamination", fileName)) %>% 
+  ggplot(aes(x=fileName, y=count, fill=group)) + 
+  geom_bar(width = 1, stat = "identity", position = position_stack(reverse = TRUE), colour = "white") + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.ticks.x = element_blank(), 
+        axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) + 
+  scale_y_continuous(labels = scales::comma) + 
+  scale_fill_manual(values = c("#FF6666", "#3399FF"), name = "", labels = c("Aligned", "Unaligned")) + 
+  facet_grid(.~length, scales = "free_x", space = "free_x")
+
+##Plot number of reads aligned and unaligned for sample with variation in endogenous content
+totalCount %>% select(fileName, fastqCount, alnCount, length) %>% 
+  mutate(Unaligned = fastqCount - alnCount) %>% 
+  select(-fastqCount) %>% 
+  melt(id.vars = c("fileName", "length"), variable.name = "group", value.name = "count") %>% 
+  filter(grepl("contamination", fileName)) %>% 
+  ggplot(aes(x=fileName, y=count, fill=group)) + 
+  geom_bar(width = 1, stat = "identity", position = position_stack(reverse = TRUE), colour = "white") + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.ticks.x = element_blank(), 
+        axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) + 
+  scale_y_continuous(labels = scales::comma) + 
+  scale_fill_manual(values = c("#FF6666", "#3399FF"), name = "", labels = c("Aligned", "Unaligned")) + 
+  facet_grid(.~length, scales = "free_x", space = "free_x")
+
+```
+
+Table summarising the proportion of reads aligned for each simulated dataset.
+
+```{r table-prop aligned reads, message=FALSE}
+#Calculate % of reads aligned/unaligned, duplicate/nonduplicate and add to totalCountTable
+totalCount <- totalCount %>% 
+  mutate(propAln = (alnCount/fastqCount)*100, 
+         propUnAln = ((fastqCount-alnCount)/fastqCount)*100, 
+         propDup = (dupCount/alnCount)*100, 
+         propNonDup = (nonDupCount/alnCount)*100)
+#round % to 2 decimal places
+totalCount[,7:10] <- round(totalCount[,7:10],2)
+totalCount %>% select(fileName, length, propAln) %>% pander(caption = "Proportion of reads aligning to different simulated datasets")
+```
+
+Summarise the number of reads aligning to each genome, for each dataset, after MAPQ 25 filtering and removal of results for genomes to which fewer than 500 reads aligned.
+
+```{r eval=FALSE, message=FALSE}
+
+#Extract counts for split.bam files from mapCount
+splitCount <- mapCount %>% subset(grepl("_split.bam", fileName))
+#edit fileName to remove '_split.bam'
+splitCount$fileName <- gsub('_split.bam', '', splitCount$fileName)
+
+#summarise total count for each split.bam file
+totalSplitCount <- splitCount %>% filter(MAPQ > 24) %>% 
+  select(-MAPQ) %>% 
+  group_by(fileName) %>% 
+  summarise_each(funs(sum))
+
+#split out genome names
+extractGenomeName <- function(x){
+  x %>% mutate(genome = str_extract(fileName,  "(A.actinomyces|A.oris|A.parvulum|B.subtilis|C.gracilis|C.sporogenes|E.saphenum|E.sulci|F.nucleatum|H.influenza|K.flavida|L.buccalis|M.neoaurum|N.meningitidis|N.sicca|P.denticola|P.florescens|P.gingivalis|P.intermedia|P.propionicum|R.dentocariosa|S.epidermidis|S.gordonii|S.mitis|S.mutans|S.roseum|S.sanguinis|T.denticola|T.forsythia|M.oralis)"), 
+               fileName = str_replace(fileName, "_(A.actinomyces|A.oris|A.parvulum|B.subtilis|C.gracilis|C.sporogenes|E.saphenum|E.sulci|F.nucleatum|H.influenza|K.flavida|L.buccalis|M.neoaurum|N.meningitidis|N.sicca|P.denticola|P.florescens|P.gingivalis|P.intermedia|P.propionicum|R.dentocariosa|S.epidermidis|S.gordonii|S.mitis|S.mutans|S.roseum|S.sanguinis|T.denticola|T.forsythia|M.oralis)", ""))
+}
+
+#apply function to totalSplitCount
+totalSplitCount <- extractGenomeName(totalSplitCount)
+totalSplitCount$genome <- gsub('A.actinomyces', 'A.actinomycetemcomitans', totalSplitCount$genome)
+
+#remove results where fewer than 500 reads have mapped to the genome
+totalSplitCount <- totalSplitCount %>% filter(count >= 500)
+
+#edit fileNames to make them more concise
+totalSplitCount$fileName <- editSimDataFileNames(totalSplitCount)
+
+```
+
+### Miscoding Lesions
+
+Cytosine is deaminated to uracil. Because uracil preferentially base-pairs with adenine, its presence in the aDNA fragments results in a C to T transition mutation during sequencing, known as a miscoding lesion. The extent of cytosine deamination can therefore be estimated by calculating the frequency of cytosine to thymine substitutions in the aligned sequence compared to the reference genome.
+
+```{r substitution frequency, message=FALSE}
+
+############### import nucleotide substitution data ###############
+
+#Create a vector with desired column names
+subDataColNames <- (c("Chr", "End", "Std", "Pos", "A", "C", "G", "T", "Total", 
+                      "GtoA", "CtoT", "AtoG", "TtoC", "AtoC", "AtoT", "CtoG", 
+                      "CtoA", "TtoG", "TtoA", "GtoC", "GtoT"))
+
+# create list of all .txt files in folder 
+ntSubFiles <- list.files("mapDamageData", pattern = "misincorporation.txt",
+                         full.names = TRUE, recursive = TRUE)
+
+# read-in files and bind into a data frame that include the FileName
+ntSubData <- ntSubFiles %>% lapply(function(x){
+  read_delim(x, delim = "\t", skip = 4, col_names = FALSE, col_type = "cccnnnnnnnnnnnnnnnnnn---------") %>% 
+    set_colnames(subDataColNames) %>% filter(Total > 0) %>% filter(Pos < 26) %>%
+    mutate(fileName = x) %>% select(-Chr)
+}) %>%
+  bind_rows
+
+#Edit FileName to include only the sampleID and Genome
+ntSubData$fileName <- gsub('mapDamageData/', '', ntSubData$fileName)
+ntSubData$fileName <- gsub('_split.bam/misincorporation.txt', '', ntSubData$fileName)
+
+#Extract genome ID from the split fileName, and make fileNames mroe concise
+ntSubData <- extractGenomeName(ntSubData)
+ntSubData$genome <- gsub('A.actinomyces', 'A.actinomycetemcomitans', ntSubData$genome)
+ntSubData$fileName <- editSimDataFileNames(ntSubData)
+
+#Collate counts for pos and neg strand
+ntSubData <- ntSubData %>% split(f = .$fileName) %>%
+  lapply(function(x){x %>% select(-fileName) %>% split(f = .$End) %>% lapply(function(z){
+    z %>% select(-End) %>% split(f = .$genome) %>% 
+      lapply(function(a){a %>% select(-genome, -Std) %>% group_by(Pos) %>% summarise_each(funs(sum))}) %>% 
+      bind_rows(.id = "genome")}) %>% 
+      bind_rows(.id = "End")}) %>% bind_rows(.id = "fileName")
+
+################## Counts for each genome ##############
+
+#Add totalFilteredCount to ntSubData
+ntSubData <- totalSplitCount %>% select(fileName, genome, count) %>% 
+  left_join(ntSubData, by = c("fileName", "genome"))
+
+#Omit any 'NA' values introduced by joining of the count data
+ntSubData <- na.omit(ntSubData)
+
+################## Graphing ntSubData ##############
+
+# create graphing function
+ntSub.graph <- function(df, na.rm = TRUE, ...){
+  
+  # Specify sampleID
+  sampleID <- unique(df$fileName)
+  
+  # create list of genomeID's in data to loop over 
+  genomeID_list <- unique(df$genome)
+  
+  # create list of counts in data to loop over
+  genomeCount_list <- unique(df$count)
+  
+  # create for loop to split data based on sampleID 
+  for (i in seq_along(genomeID_list)) {
+    
+    # create object to store 5p data
+    SubFreq_5p <- subset(df, df$genome==genomeID_list[i]) %>% filter(End == "5p") %>% 
+      select(-End, -genome, -fileName, -count) %>% 
+      #group_by(Pos) %>% summarise_each(funs(sum)) %>% 
+      mutate(GtoA = GtoA/G, CtoT = CtoT/C, AtoG = AtoG/A, TtoC = TtoC/T, 
+             AtoC = AtoC/A, AtoT = AtoT/A, CtoG = CtoG/C, CtoA = CtoA/C, 
+             TtoG = TtoG/T, TtoA = TtoA/T, GtoC = GtoC/G, GtoT = GtoT/G) %>% 
+      select(-A, -C, -G, -T, -Total) %>% 
+      melt(id.vars = c("Pos"), variable.name = "substitution", value.name = "Frequency")
+    
+    #create object to store 3p data
+    SubFreq_3p <- subset(df, df$genome==genomeID_list[i]) %>% filter(End == "3p") %>% 
+      select(-End, -genome, -fileName, -count) %>% 
+      #group_by(Pos) %>% summarise_each(funs(sum)) %>% 
+      mutate(GtoA = GtoA/G, CtoT = CtoT/C, AtoG = AtoG/A, TtoC = TtoC/T, 
+             AtoC = AtoC/A, AtoT = AtoT/A, CtoG = CtoG/C, CtoA = CtoA/C, 
+             TtoG = TtoG/T, TtoA = TtoA/T, GtoC = GtoC/G, GtoT = GtoT/G) %>% 
+      select(-A, -C, -G, -T, -Total) %>% 
+      melt(id.vars = c("Pos"), variable.name = "substitution", value.name = "Frequency")
+    
+    #plot to object, 5p data
+    plot5pData <- SubFreq_5p %>% ggplot(aes(x=Pos, y=Frequency, colour=substitution)) + 
+      geom_line() + 
+      theme_bw() + 
+      scale_y_continuous(limits = c(0, 0.55), position = "left") + 
+      ylab("Substitution Frequency") + 
+      xlab("Position from the 5' end") + 
+      scale_colour_manual(values=c(palette15), name = "Substitution") +
+      theme(legend.position = "none")
+    
+    #plot to object, 3p data 
+    plot3pData <- SubFreq_3p %>% ggplot(aes(x=Pos, y=Frequency, colour=substitution)) + geom_line() + theme_bw() +
+      theme(axis.title.y=element_blank()) + scale_x_reverse() + 
+      scale_y_continuous(limits = c(0, 0.55), position = "right") +
+      scale_colour_manual(values=c(palette15), name = "Substitution") +
+      ylab("Substitution Frequency") + xlab("Position from the 3' end")
+    
+    #print plots
+    grid.arrange(plot5pData, plot3pData, ncol=2, widths=c(0.8,1), 
+                 top = (paste(genomeID_list[i], '-',paste(sampleID,'(No. Reads = ', paste(genomeCount_list[i],')')))))
+    
+    #End loop
+  }
+}
+
+#plot
+ntSubData %>% filter(fileName == "30bp_0.1_undamaged") %>% ntSub.graph()
+
+```
+
+This simulated dataSet was undamaged, and thus there is not expected to be substitutions between the aligned read and the reference genome. This holds true for non-spurious alignments (e.g. F.nucleatum, N.meningitidis, P.gingivalis, S.sanguinis, S.mutans...). Other genomes such as K.flavida show substitutions throughout the sequence, indicative that they are spurious alignments. Filtering out these genomes prior to reaching this point would eliminate unnecessary computing resources. In some instances, we observe separation between transition mutations and transversion mutations (e.g. S.gordonii). We know S.gordonii was not one of the genomes used to simulate reads. Instead the reads aligning to this genome are related species from the same genus. Where there are reads aligning from the same same species  but a different strain (e.g. F.nucleatum), there is slight separation between C-T and G-A substitution frequency and other mutations.
+
+```{r message=FALSE}
+
+#plot simulated damage file
+ntSubData %>% filter(fileName == "30bp_0.5_damaged") %>% ntSub.graph()
+
+```
+
+As with the undamaged simulated data, spurious alignment results in multiple nucleotide substitutions being observed between the simulated and reference genome throughout 25bp ends of the read. The fewer reads aligning the more significant this effect. By filtering out data for genomes with fewer than 1000 reads aligning we can remove all but 1 of the spurious alignments (H.influenza).
+
+```{r message=FALSE}
+
+#filtering by read count alone (>1000 reads)
+ntSubData %>% filter(fileName == "70bp_0.1_damaged", count > 1000) %>% ntSub.graph()
+
+```
+
+Similar results are expected for additional simulated datasets, which mainly varied in the length of the reads simulated.
+
+```{r message=FALSE}
+
+#plot simulated damage file
+ntSubData %>% filter(fileName == "50bp_high-contamination_damaged") %>% ntSub.graph()
+
+```
+
+
+```{r message=FALSE}
+
+#filtering by read count alone (>1000 reads)
+ntSubData %>% filter(fileName == "70bp_0.1_damaged", count > 1000) %>% ntSub.graph()
+
+```
+
+With the exception of the 2 spurious alignments, all samples show a characteristing increase in C to T substitutions at the 5' end, and G to A substitutions at the 3' end. The levels of these are consistent across species, appearing to be occuring at a frequency of ~0.08. This is slightly less than the damage levels applied to the simulated data sets. The more reads aligning to the genome the smoother the curves. When we compare results for S.mitis and S.mutans we see separation between the transition and transversion mutations for S.mitis but not S.mutans, even though S.mutans has more reads aligning to the genome. This may be because the reference genome used to simulate reads for S.mitis is the same as that used for alignment, while simulated reads for S.mutans were produced using 2 reference genomes, only one of which was then included in the bwa index for alignment. With F.nucleatum we observe a separation between G/C -> A/T mutations and all others despite the largest number of reads aligning to this genome. Only one of the F.nucleatum strains used for simulating this data set is included in the alignment index.
+
+If we plot damage nucleotide substitution profiles for dataSets with 50% deamination rate we see an expected increase in the substitution frequency at the ends of reads. 
+
+```{r message=FALSE}
+
+#plot 0.5 damaged dataSet, filtering out low abundant genomes
+ntSubData %>% filter(fileName == "70bp_0.5_damaged", count > 1000) %>% ntSub.graph()
+
+```
+
+In this instance, count filtering removes all spurious alignments except H.influenza, which also demonstrates the characteristing C/G -> T/A substitutions at the ends of reads. This suggests that spurious alignments may still be helpful in detecting damage signals from metagenomic dataSets, albeit the substitution frequency for these alignments appears to be slightly lower than others. In all instances the substitution frequency at the final position is lower than the damage rate applied to the simulated dataSets (0.38 not 0.5), suggesting that mapDamage2.0 may underestimate the deamination rate, or that gargamel applies a slightly lower deamination rate than stated. The highest level of damage varies slightly between species.
+
+```{r overall CtoT and GtoA rates, message=FALSE}
+
+#Generate a list of sub_freq.txt files
+subFreq.Files <- list.files("mapDamageData/", 
+                            pattern = "_freq.txt", 
+                            full.names = TRUE, 
+                            recursive = TRUE)
+
+#Write a function to load data and edit the fileName to remove unncessesary information
+loadMisincorpData <- function(x){
+  #load data
+  data <- x %>% lapply(function(z){z %>% read_delim(delim = "\t", 
+                                                    skip=1, col_names = FALSE, 
+                                                    col_types = cols("i", "c"), 
+                                                    n_max = 5) %>% 
+      set_colnames(c("pos", "freq")) %>% 
+      mutate(fileName = z)}) %>% 
+    bind_rows()
+  #convert character to numeric
+  data$freq <- as.numeric(data$freq)
+  #extract type of substitution from fileName and insert as new variable
+  data <- data %>% mutate(sub = str_extract(fileName,  "(CtoT|GtoA)"))
+  #edit fileName to remove top directory
+  data$fileName <- gsub('mapDamageData//', '', data$fileName)
+  data$fileName <- gsub('_split.bam/5pCtoT_freq.txt', '', data$fileName)
+  data$fileName <- gsub('_split.bam/3pGtoA_freq.txt', '', data$fileName)
+  return(data)
+}
+
+#Apply function to subFreq.Files
+subFreqData <- loadMisincorpData(subFreq.Files)
+
+#Extract genome ID from the fileName and place this into data frame as separate variable
+subFreqData <- extractGenomeName(subFreqData)
+subFreqData$genome <- gsub('A.actinomyces', 'A.actinomycetemcomitans', subFreqData$genome)
+
+#Edit fileNames to be consistent with previous
+subFreqData$fileName <- editSimDataFileNames(subFreqData)
+
+##Add information about counts for each file/genome and then cluster (as did with MAPQ and lengths)
+subFreqData <- totalSplitCount %>% select(fileName, genome, count) %>% 
+  right_join(subFreqData, by = c("fileName", "genome"))
+#Collate readCounts into bins
+subFreqData$countRange <- cut(subFreqData$count, breaks = c(0,500,1000,5000,10000,50000,100000,500000), 
+                            labels = c("0-500", "501-1000", "1001-5000", "5001-10000", "10001-50000", 
+                                       "50001-100000", "100001-500000"), right = FALSE)
+#re-order columns
+subFreqData <- subFreqData[,c(1:3,7,4:6)]
+
+#extract damage rate from fileName (fixed abundances only) and plot all together with facet_grid
+subFreqData <- subFreqData %>% mutate(damageRate = str_extract(fileName, "_(0.1|0.5|Real-profile|)_"))
+
+#Generate a df stating whether alignedGenome represents known endogenous or spurious alignment.
+alignmentType <- data_frame(genome = c("A.actinomycetemcomitans", "A.oris", "B.subtilis", "F.nucleatum", "H.influenza", "K.flavida", "L.buccalis", 
+                                       "N.meningitidis", "N.sicca", "P.denticola", "P.gingivalis", "P.propionicum", "R.dentocariosa", "S.epidermidis", 
+                                       "S.gordonii", "S.mitis", "S.mutans", "S.roseum", "S.sanguinis"), 
+                            alignmentType = c("endogenous", "endogenous", "endogenous", "endogenous", "spurious", "spurious", "endogenous", 
+                                              "endogenous", "endogenous", "endogenous", "endogenous", "spurious", "endogenous", "endogenous", 
+                                              "spurious", "endogenous/spurious", "endogenous", "spurious", "endogenous"))
+
+#Generate a df stating whether alignedGenome represents known spurious alignment, known endogeous, known environmental or known laboratory contaminant.
+source <- data_frame(genome = c("A.actinomycetemcomitans", "A.oris", "B.subtilis", "F.nucleatum", "H.influenza", "K.flavida", "L.buccalis", 
+                                       "N.meningitidis", "N.sicca", "P.denticola", "P.gingivalis", "P.propionicum", "R.dentocariosa", "S.epidermidis", 
+                                       "S.gordonii", "S.mitis", "S.mutans", "S.roseum", "S.sanguinis"), 
+                            source = c("endogenous", "endogenous", "environmental", "endogenous", "spurious", "spurious", "endogenous", 
+                                              "endogenous", "endogenous", "endogenous", "endogenous", "spurious", "endogenous", "laboratory", 
+                                              "spurious", "endogenous/spurious", "endogenous", "spurious", "endogenous"))
+
+#join alignmentType info to test object
+subFreqData <- left_join(subFreqData, alignmentType, by = "genome")
+#join source info to test object
+subFreqData <- left_join(subFreqData, source, by = "genome")
+
+##Add info on GC content. Like before group similar and plot
+
+GC <- read_delim("expandedGenomeList.txt", delim = "\t", col_names = c("genome", "GC"), 
+                 col_types = "c-----n-")
+GC$genome <- gsub('A.actinomyces', 'A.actinomycetemcomitans', GC$genome)
+
+#bind this info to subFreqData
+subFreqData <- left_join(subFreqData, GC, by = "genome")
+#Collate GCcontent into bins
+subFreqData$GCRange <- cut(subFreqData$GC, breaks = c(20,40,60,80), 
+                              labels = c("20-40", "41-60", "61-80"), right = FALSE)
+
+subFreqData %>% filter(fileName != "low-contamination_ACADadapters_damaged") %>%  
+  filter(pos == "1") %>% filter(!grepl("contamination", fileName)) %>% 
+  ggplot(aes(x=fileName, y=freq)) + 
+  geom_jitter(aes(colour=alignmentType), width = 0.2) +
+  geom_boxplot(alpha = 0.0) +
+  facet_wrap(~sub) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) + 
+  scale_colour_manual(values = c("endogenous" = "#FF3333", "environmental" = "#009900",
+                                 "laboratory" = "#FF9900", "spurious" = "#3333FF", "endogenous/spurious" = "#FF99CC"), 
+                      breaks = c("endogenous", "environmental", "laboratory", "endogenous/spurious", "spurious")) +
+  labs(x="", y="Misincorporation frequency", title="Fixed abundance and damage rate")
+
+subFreqData %>% filter(fileName != "low-contamination_ACADadapters_damaged") %>%  
+  filter(pos == "1") %>% filter(grepl("contamination", fileName)) %>% 
+  ggplot(aes(x=fileName, y=freq)) + 
+  geom_jitter(aes(colour=source), width = 0.2) +
+  geom_boxplot(alpha = 0.0) +
+  facet_wrap(~sub) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) + 
+  scale_colour_manual(values = c("endogenous" = "#FF3333", "environmental" = "#009900",
+                                 "laboratory" = "#FF9900", "spurious" = "#3333FF", "endogenous/spurious" = "#FF99CC"), 
+                      breaks = c("endogenous", "environmental", "laboratory", "endogenous/spurious", "spurious")) +
+  labs(x="", y="Misincroporation frequency", title="Varied abundance and damage rate")
+
+```
+
+The overall trend is as expected. Undamaged sequences typically demonstrate a misincorportation frequency of 0. Those that are higher represent species that were not present in the simulated dataset (e.g. C.gracilis, E.saphenum, T.denticola) and these frequencies simply reflect the poor alignment that has occured due to some conservation in sequence between microbial species. In the damaged data sets we observe a C to T frequency of close to 0.1 for the 10% damage, and between 0.3 and 0.4 for the 50% damage.
+
+In samples where the abundance of environmental and endogenous content was varied as was the damage rate applied to these subgroups, we see again expected misincorporation frequencies. Laboratory contaminant that was undamaged shows a misincorporation frequency of 0. Environmental contaminant, represented by _B.subtilis_ shows a substitution frequency of ~8%. Endogenous sequences, to which a deamination rate of 30% was applied show a 22% misincorporation frequency at the first and final position. Genomes to which reads are consistently misassigned (labelled spurious) are the data points that most consistently vary from the mean deamination rate, supporting the idea that misalignment will result in over and/or under estimation of the level of damage.
+
+```{r message=FALSE}
+
+#Repeat above 2 plots but use count rather than alignmentType to differentiate points
+subFreqData %>% filter(fileName != "low-contamination_ACADadapters_damaged") %>%  
+  filter(pos == "1") %>% filter(!grepl("contamination", fileName)) %>% 
+  ggplot(aes(x=fileName, y=freq)) + 
+  geom_jitter(aes(colour=countRange), width = 0.2) +
+  geom_boxplot(alpha = 0.0) +
+  facet_wrap(~sub) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) + 
+  scale_colour_manual(values = c("501-1000" = "#3333FF", "1001-5000" = "#990099",
+                                 "10001-50000" = "#FF3333", "50001-100000" = "#009900", 
+                                 "100001-500000" = "#FF9900")) + 
+  labs(x="", y="Substitution frequency", colour="")
+
+
+```
+
+If we replot substitution frequency plots for simulated data sets with fixed bacterial abundance and deamination rate, and colour points according to the number of alignments that contributed to the estimate, we see that the data points with fewer alignments (blue and purple) typically correspond with known spurious alignments. Filtering out data from genomes to which fewer than 1000 or fewer than 5000 reads have aligned, may improve the estimated misincorporation frequency for a given species.
+
+```{r message=FALSE}
+
+#Repeat above plots but filter out genomes with fewer than 1000 reads aligning
+subFreqData %>% filter(fileName != "low-contamination_ACADadapters_damaged") %>%  
+  filter(pos == "1") %>% filter(!grepl("contamination", fileName)) %>% 
+  filter(count > 1000) %>% 
+  ggplot(aes(x=fileName, y=freq)) + 
+  geom_jitter(aes(colour=countRange), width = 0.2) +
+  geom_boxplot(alpha = 0.0) +
+  facet_wrap(~sub) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) + 
+  scale_colour_manual(values = c("501-1000" = "#3333FF", "1001-5000" = "#990099",
+                                 "10001-50000" = "#FF3333", "50001-100000" = "#009900", 
+                                 "100001-500000" = "#FF9900")) + 
+  labs(x="", y="Substitution frequency", colour="")
+
+#Repeat above plots but filter out genomes with fewer than 5000 reads aligning
+subFreqData %>% filter(fileName != "low-contamination_ACADadapters_damaged") %>%  
+  filter(pos == "1") %>% filter(!grepl("contamination", fileName)) %>% 
+  filter(count > 5000) %>% 
+  ggplot(aes(x=fileName, y=freq)) + 
+  geom_jitter(aes(colour=countRange), width = 0.2) +
+  geom_boxplot(alpha = 0.0) +
+  facet_wrap(~sub) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1)) + 
+  scale_colour_manual(values = c("501-1000" = "#3333FF", "1001-5000" = "#990099",
+                                 "10001-50000" = "#FF3333", "50001-100000" = "#009900", 
+                                 "100001-500000" = "#FF9900")) + 
+  labs(x="", y="Substitution frequency", colour="")
+
+```
+
+To more clearly observe the effect of misalignment on the reported substitution frequency, data was replotted by genome to which reads aligned rather than dataset.
+
+```{r message=FALSE}
+
+damage_labels <- c(`_0.1_` = "0.1 deamination",
+                   `_0.5_` = "0.5 deamination",
+                   `_Real-profile_` = "LaBrana profile")
+
+#Damage rate by genome - fixed abundance
+subFreqData %>% filter(!grepl("contamination", fileName)) %>% 
+  filter(!grepl("undamaged", fileName)) %>% 
+  filter(pos == "1") %>% 
+  ggplot(aes(x=genome, y=freq)) + 
+  geom_boxplot() +
+  geom_jitter(aes(colour=alignmentType), width = 0.2) + 
+  facet_grid(damageRate~sub, scales = "free_y", labeller = labeller(damageRate = damage_labels)) + 
+  scale_colour_manual(values = c("endogenous" = "#FF3333", "environmental" = "#009900", "laboratory" = "#FF9900", "spurious" = "#3333FF", "endogenous/spurious" = "#FF99CC"), 
+                      name = "Alignment") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1, size=10)) + 
+  labs(x="", y="Substitution frequency", title="Fixed abundance")
+
+#extract contamination level from fileName and plot all together with facet_grid
+subFreqData <- subFreqData %>% mutate(contaminationLevel = str_extract(fileName, "(low-contamination|low-moderate-contamination|moderate-contamination|high-contamination)"))
+
+contamination_labels <- c(`low-contamination` = "low", `low-moderate-contamination` = "low-moderate", `moderate-contamination` = "moderate", `high-contamination` = "high")
+
+#Damage rate by genome - varied abundance
+subFreqData %>% filter(grepl("contamination", fileName)) %>% 
+  filter(!grepl("undamaged", fileName)) %>% 
+  filter(pos == "1") %>% 
+  ggplot(aes(x=genome, y=freq)) + 
+  geom_boxplot() +
+  geom_jitter(aes(colour=source), width = 0.2) + 
+  facet_grid(contaminationLevel~sub, scales = "free_y", labeller = labeller(contaminationLevel = contamination_labels)) + 
+  scale_colour_manual(values = c("endogenous" = "#FF3333", "environmental" = "#009900", "laboratory" = "#FF9900", "spurious" = "#3333FF", "endogenous/spurious" = "#FF99CC"),
+                      name = "Alignment") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1, size=10)) + 
+  labs(x="", y="Substitution frequency", title="Varied abundance")
+
+```
+
+## Baysien estimates of damage from mapDamage2.0
+
+```{r message=FALSE}
+
+################ Import all data points for delta.S, delta.D and lambda ##############
+
+#list files
+mapDamage_summ_stats_files <- list.files("mapDamageData", pattern = "Stats_out_MCMC_iter_summ_stat.csv", 
+                                    full.names = TRUE, recursive = TRUE)
+#Write a function to load data and edit the fileName to remove unncessesary information
+loadSummStatsData <- function(x){
+  #load data
+  data <- x %>% lapply(function(z){z %>% 
+      read_delim(delim = ",", skip=1, 
+                 col_names = c("row.names", "theta", "delta.D", "delta.S", "Lambda"), 
+                 n_max = 2, col_types = "cnnnn--") %>% 
+      mutate(fileName = z)}) %>% 
+    bind_rows()
+  #edit fileName to remove top directory
+  data$fileName <- gsub('mapDamageData/', '', data$fileName)
+  data$fileName <- gsub('_split.bam/Stats_out_MCMC_iter_summ_stat.csv', '', data$fileName)
+  return(data)
+}
+
+#apply function to load data
+simData_summStats <- loadSummStatsData(mapDamage_summ_stats_files)
+
+#Edit row.names to enable use of greek letters in facet labels
+names(simData_summStats) <- c("row.names","theta","delta[d]","delta[s]","lambda","fileName")
+
+#Extract genome from fileName
+simData_summStats <- extractGenomeName(simData_summStats)
+#Edit fileName to increase readability
+simData_summStats$fileName <- editSimDataFileNames(simData_summStats)
+#Edit A.actinomyces to correct name
+simData_summStats$genome <- gsub('A.actinomyces', 'A.actinomycetemcomitans', simData_summStats$genome)
+
+
+#join alignmentType info to test object
+simData_summStats <- left_join(simData_summStats, alignmentType, by = "genome")
+#join source info to test object
+simData_summStats <- left_join(simData_summStats, source, by = "genome")
+
+
+##Add information about counts for each file/genome and then cluster (as did with MAPQ and lengths)
+simData_summStats <- totalSplitCount %>% select(fileName, genome, count) %>% 
+  right_join(simData_summStats, by = c("fileName", "genome"))
+#Collate readCounts into bins
+simData_summStats$countRange <- cut(simData_summStats$count, 
+                                    breaks = c(0,500,1000,5000,10000,50000,100000,500000), 
+                                    labels = c("0-500", "501-1000", "1001-5000", "5001-10,000", 
+                                               "10,001-50,000", "50,001-100,000", "100,001-500,000"), 
+                                    right = FALSE)
+
+```
+
+For samples with 'Real-damage-profile', called misincorporation text file (LaBrana profile) containing empirically observed substitution frequencies.
+
+For all other samples, damage was simulated using the following briggs parameters: nick freq = 0.03, length overhang = 0.25, delta.D (cytosine deamination probability in double strand context) = 0.01.
+
+The final value, delta.S, varied for datasets and genomes as follows
+  0.1_damage = delta.S (cytosine deamination probability in a single stranded context) = 0.1 (10% deamination)
+  0.5_damage = 0.5 (50% deamination)
+  endogenous sequences in samples with varied contamination, delta.S = 0.3
+  environmental sequences in samples with varied contamination, delta.S = 0.1
+  laboratory sequences in samples with varied contamination, all briggs parameters = 0
+  
+
+```{r plots of damage estimates, message=FALSE}
+
+simData_summStats %>% filter(row.names == "Mean") %>% 
+  filter(!grepl("undamaged", fileName)) %>% 
+  filter(!grepl("contamination", fileName)) %>% 
+  mutate(damageRate = str_extract(fileName, "_(0.1|0.5|Real-profile)_")) %>% 
+  select(-source, -theta, -countRange, -count, -genome, -row.names) %>% 
+  melt(id.vars = c("fileName", "alignmentType", "damageRate")) %>% 
+  ggplot(aes(x=damageRate, y=value)) + 
+    geom_boxplot() + 
+    geom_jitter(aes(colour=alignmentType), width = 0.2) + 
+    facet_wrap(~variable, scales = "free_y", labeller = label_parsed) + 
+    scale_colour_manual(values = c("endogenous" = "#FF3333", "environmental" = "#009900",
+                                 "laboratory" = "#FF9900", "spurious" = "#3333FF", "endogenous/spurious" = "#FF99CC"), 
+                      breaks = c("endogenous", "spurious", "endogenous/spurious"), 
+                      labels = c("Accurate", "Spurious", "Mixture (accurate/spurious)"), name = "Alignment") + 
+    labs(x="", y="", title="Fixed abundance") + 
+    scale_x_discrete(labels = c("10% deamination", "50% deamination", "LaBrana profile")) + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 1, size = 11), 
+          axis.text.y = element_text(size = 11), 
+          strip.text = element_text(size = 14), 
+          legend.key.size = unit(2, 'lines'), 
+          legend.text = element_text(size = 14), 
+          legend.title = element_text(size = 14, face = "bold"))
+```
+
+Looking at the plots of delta.S, when a delta.S of 0.1 is applied, the mean delta.S is closer to 2. When a delta.S of 0.5 is applied, the estimated damage from mapDamage2.0 is close to 1. When a delta.S of 0.3 is applied, the mean delta.S reported by mapDamage2.0 is close to 6. It appears that mapDamage2.0 is overestimating or that these estimates should be halved.
+
+
+
